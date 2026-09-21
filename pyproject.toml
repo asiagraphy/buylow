@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2.32",      # 증권사 REST 클라이언트
     "pandas>=2.2,<3",      # ETL 및 LEAN Python 전략
     "numpy>=1.26,<3",
+    "exchange-calendars>=4.5,<5",  # 미국 휴장일·조기폐장·서머타임
 ]
 
 [dependency-groups]
