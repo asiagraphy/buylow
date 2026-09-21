@@ -41,6 +41,7 @@ config.local.yaml
 config/*.local.*
 .env
 .env.local
+.env.local.tmp
 # 증권사 접근토큰 캐시 (사용자별, 절대 커밋 금지)
 .kis_token.json
 .toss_token.json

@@ -221,13 +221,14 @@ class KisUsClient:
     def book(self, stock: Stock) -> Quote:
         payload, _ = self.request("GET", "/uapi/overseas-price/v1/quotations/inquire-asking-price", "HHDFS76200100",
                                   {"AUTH": "", "EXCD": stock.quote_exchange, "SYMB": stock.symbol})
-        market, book = payload["output1"], payload["output2"]
-        if isinstance(market, list):
-            market = market[0]
-        if isinstance(book, list):
-            book = book[0]
-        timestamp = datetime.strptime(book["dymd"] + book["dhms"].zfill(6), "%Y%m%d%H%M%S").replace(tzinfo=NEW_YORK)
-        quote = Quote(timestamp, float(market["last"]), float(book["pbid1"]), float(book["pask1"]))
+        fields = {}
+        for key in ("output1", "output2", "output3"):
+            block = payload.get(key) or {}
+            if isinstance(block, list):
+                block = block[0] if block else {}
+            fields.update(block)
+        timestamp = datetime.strptime(fields["dymd"] + fields["dhms"].zfill(6), "%Y%m%d%H%M%S").replace(tzinfo=NEW_YORK)
+        quote = Quote(timestamp, float(fields["last"]), float(fields["pbid1"]), float(fields["pask1"]))
         if not all(math.isfinite(value) and value > 0 for value in (quote.last, quote.bid, quote.ask)) or quote.ask < quote.bid:
             raise BrokerError("미국 주식 호가를 확인할 수 없습니다")
         return quote
@@ -271,6 +272,8 @@ class KisUsClient:
         return str(number)
 
     def cancel(self, stock: Stock, number: str, remaining: int) -> None:
+        if not number or type(remaining) is not int or remaining <= 0:
+            raise ValueError("취소할 주문번호와 양의 정수 잔량이 필요합니다")
         transaction = "VTTT1004U" if self.mode == "demo" else "TTTT1004U"
         self.request("POST", "/uapi/overseas-stock/v1/trading/order-rvsecncl", transaction,
             {**self._account_parameters(), "OVRS_EXCG_CD": stock.exchange, "PDNO": stock.symbol,

@@ -111,10 +111,14 @@ def setup(mode: str, path: Path | None = None):
         else:
             output.append(line)
     output.extend(f"{key}={value}" for key, value in values.items() if key not in replaced)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write("\n".join(output) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
     print(".env.local에 저장했습니다. API 호출과 주문은 실행하지 않았습니다.")
 
 
@@ -135,6 +139,11 @@ def doctor(mode: str, online: bool):
             rows = client.holdings({stock.exchange for stock in DEFAULT_STOCKS})
             orders = client.orders(datetime.now(NEW_YORK).date())
             print(f"계좌 조회 성공: 보유 응답 {len(rows)}건, 당일 주문 응답 {len(orders)}건")
+            quote = client.book(DEFAULT_STOCKS[0])
+            age = (datetime.now(NEW_YORK) - quote.time).total_seconds()
+            print(f"AAPL 호가 기준: {quote.time.isoformat()}, 경과 {age:.0f}초")
+            if not quote.fresh(datetime.now(NEW_YORK)):
+                print("호가가 지연되거나 장이 닫혀 있습니다. 정규장에도 지연되면 실시간 시세 권한을 확인하세요.")
             print("주문은 전송하지 않았습니다.")
     else:
         print("로컬 설정만 확인했습니다. 실제 연결 점검에는 --online을 붙이세요.")

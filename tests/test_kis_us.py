@@ -124,3 +124,30 @@ def test_price_rounding_and_invalid_quantities():
     with pytest.raises(ValueError):
         instance.place(Stock("AAPL"), "BUY", 0, 100)
     assert not transport.calls
+
+
+def test_book_requires_timestamp_and_both_sides():
+    instance, _ = client([Response({"rt_cd": "0", "output1": {"last": "100", "dymd": "20260921", "dhms": "100000"},
+                                   "output2": {"pbid1": "99.99", "pask1": "100.01"}, "output3": {}})])
+    quote = instance.book(Stock("AAPL"))
+    assert quote.fresh(datetime(2026, 9, 21, 10, 0, 30, tzinfo=NEW_YORK))
+    assert not quote.fresh(datetime(2026, 9, 21, 10, 15, tzinfo=NEW_YORK))
+    assert quote.spread < 0.002
+
+
+def test_bars_do_not_expose_in_progress_minute():
+    instance, transport = client([Response({"rt_cd": "0", "output2": [
+        {"xymd": "20260921", "xhms": "095400", "open": "100", "high": "101", "low": "99", "last": "100.5", "evol": "200"},
+        {"xymd": "20260921", "xhms": "095500", "open": "101", "high": "102", "low": "100", "last": "101.5", "evol": "100"},
+    ]})])
+    now = datetime(2026, 9, 21, 9, 55, 10, tzinfo=NEW_YORK)
+    bars = instance.bars(Stock("AAPL"), now.replace(hour=9, minute=30), now)
+    assert len(bars) == 1 and bars[0].end.minute == 55
+    assert transport.calls[-1][3]["params"]["EXCD"] == "NAS"
+
+
+def test_missing_acknowledgment_number_is_uncertain():
+    instance, transport = client([Response({"rt_cd": "0", "output": {}})])
+    with pytest.raises(OrderUncertain):
+        instance.place(Stock("AAPL"), "BUY", 1, 100)
+    assert len(transport.calls) == 2
