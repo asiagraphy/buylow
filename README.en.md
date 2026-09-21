@@ -242,22 +242,21 @@ You need **.NET 10 SDK** (runs the engine), **Python 3.11** (runs strategies), *
 curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
 export DOTNET_ROOT="$HOME/.dotnet" && export PATH="$HOME/.dotnet:$PATH"
 
-# 2) Python 3.11 · git   (macOS: brew / Debian·Ubuntu: apt)
-brew install python@3.11 git                              # macOS
-# sudo apt install -y python3.11 python3.11-venv git      # Linux (Debian·Ubuntu)
-curl -LsSf https://astral.sh/uv/install.sh | sh           # uv
+# 2) Install uv (git must be installed separately)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 3) Code + dependencies
 git clone https://github.com/JeongSeongMok/buylow.git
 cd buylow
-uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev]"
+uv python install 3.11
+uv sync --locked
 
 # 4) Run the dashboard (default port 8420)
-.venv/bin/python -m orchestrator.api
-# To use a different port:  BUYLOW_DASHBOARD_PORT=9000 .venv/bin/python -m orchestrator.api
+uv run --locked python -m orchestrator.api
+# To use a different port: BUYLOW_DASHBOARD_PORT=9000 uv run --locked python -m orchestrator.api
 
 # 5) (For live trading — skip if you only backtest) Build the broker adapters (KIS·Toss)
-dotnet build launcher/BuylowLauncher.csproj -c Release   # build the launcher first (restores NuGet)
+uv run --locked python -m orchestrator.lean --prepare    # check Python and build the launcher (no orders)
 scripts/build-adapter.sh                                  # build KIS·Toss adapters + copy DLLs next to the launcher
                                                           #   (one only: scripts/build-adapter.sh toss)
 ```
@@ -265,6 +264,12 @@ scripts/build-adapter.sh                                  # build KIS·Toss adap
 </details>
 
 After launching, open the dashboard in your browser (default `http://127.0.0.1:8420`, or the port you set above).
+
+`pyproject.toml`, `.python-version`, and `uv.lock` define Python 3.11 and the Python dependencies.
+The orchestrator and LEAN strategies share the uv project environment; manual activation is unnecessary.
+Run tests with `uv run --locked pytest`; omit development dependencies with `uv sync --locked --no-dev`.
+To load a `.env` file, explicitly pass `--env-file .env` to `uv run`.
+Use `uvx` for isolated standalone tools and `uv run` for this project's application and tests.
 
 ### Key setup
 

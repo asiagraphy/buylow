@@ -242,22 +242,21 @@ docker compose down
 curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
 export DOTNET_ROOT="$HOME/.dotnet" && export PATH="$HOME/.dotnet:$PATH"
 
-# 2) Python 3.11 · git   (macOS: brew / Debian·Ubuntu: apt)
-brew install python@3.11 git                              # macOS
-# sudo apt install -y python3.11 python3.11-venv git      # Linux(Debian·Ubuntu)
-curl -LsSf https://astral.sh/uv/install.sh | sh           # uv
+# 2) uv 설치 (git은 별도 설치 필요)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 3) 코드 + 의존성
 git clone https://github.com/JeongSeongMok/buylow.git
 cd buylow
-uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev]"
+uv python install 3.11
+uv sync --locked
 
 # 4) 대시보드 실행 (기본 포트 8420)
-.venv/bin/python -m orchestrator.api
-# 다른 포트로 열려면:  BUYLOW_DASHBOARD_PORT=9000 .venv/bin/python -m orchestrator.api
+uv run --locked python -m orchestrator.api
+# 다른 포트로 열려면: BUYLOW_DASHBOARD_PORT=9000 uv run --locked python -m orchestrator.api
 
 # 5) (라이브 실거래용 — 백테스트만 쓰면 생략) 증권사 어댑터 빌드(KIS·토스)
-dotnet build launcher/BuylowLauncher.csproj -c Release   # 런처 먼저(NuGet 복원)
+uv run --locked python -m orchestrator.lean --prepare    # Python 확인 + 런처 빌드(주문 없음)
 scripts/build-adapter.sh                                  # KIS·토스 어댑터 빌드 + DLL을 런처 옆에 복사
                                                           #   (하나만: scripts/build-adapter.sh toss)
 ```
@@ -265,6 +264,12 @@ scripts/build-adapter.sh                                  # KIS·토스 어댑�
 </details>
 
 실행하면 브라우저에서 대시보드(기본 `http://127.0.0.1:8420`, 위에서 바꾼 포트가 있으면 그 포트)에 접속합니다.
+
+Python 3.11과 모든 Python 의존성은 `pyproject.toml`·`.python-version`·`uv.lock`으로 관리합니다.
+오케스트레이터와 LEAN 전략은 uv가 관리하는 동일 환경을 사용하므로 수동 활성화가 필요 없습니다.
+검증은 `uv run --locked pytest`, 개발 의존성을 제외한 설치는 `uv sync --locked --no-dev`입니다.
+`.env`를 사용하면 실행 명령에 `--env-file .env`를 명시하세요.
+`uvx`는 별도 도구를 격리 실행할 때 사용하며, 이 프로젝트의 실행·테스트에는 `uv run`을 사용합니다.
 
 ### 키 설정
 

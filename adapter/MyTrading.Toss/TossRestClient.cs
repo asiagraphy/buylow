@@ -54,13 +54,29 @@ namespace MyTrading.Toss
     public class TossOrderStatus
     {
         public bool Found;
+        public string OrderId;
+        public string OrderType;
+        public string Currency;
+        public DateTime OrderedAt;
+        public decimal Quantity;
+        public decimal Price;
         public string Status;       // PENDING/PARTIAL_FILLED/FILLED/CANCELED/REJECTED/EXPIRED ...
         public bool Buy;
         public string Symbol;
         public decimal FilledQty;
         public decimal AvgPrice;
+        public decimal FilledAmount;
         public decimal Commission;
         public decimal Tax;
+
+        public decimal FillPriceSince(TossOrderStatus previous)
+        {
+            var quantity = FilledQty - previous.FilledQty;
+            if (quantity <= 0) return 0m;
+            var total = FilledAmount != 0 ? FilledAmount : FilledQty * AvgPrice;
+            var prior = previous.FilledAmount != 0 ? previous.FilledAmount : previous.FilledQty * previous.AvgPrice;
+            return (total - prior) / quantity;
+        }
 
         /// <summary>더 이상 변화 없는 종료 상태인지(폴링 중단·추적 제거 판정).</summary>
         public bool IsTerminal()
@@ -73,6 +89,8 @@ namespace MyTrading.Toss
                 case "REJECTED":
                 case "EXPIRED":
                 case "REPLACED":
+                case "CANCEL_REJECTED":
+                case "REPLACE_REJECTED":
                     return true;
                 default:
                     return false;
@@ -239,7 +257,7 @@ namespace MyTrading.Toss
         }
 
         /// <summary>POST(JSON 본문) — (성공여부, result, 오류메시지/코드).</summary>
-        private (bool ok, JToken result, string message, string code) PostJson(string path, string json, bool account)
+        private (bool ok, JToken result, string message, string code, TimeSpan retryAfter) PostJson(string path, string json, bool account)
         {
             using (var req = new HttpRequestMessage(HttpMethod.Post, _baseUrl + path))
             {
@@ -250,12 +268,14 @@ namespace MyTrading.Toss
                 JObject data = null;
                 try { data = string.IsNullOrEmpty(text) ? null : JObject.Parse(text); } catch { }
                 if (resp.IsSuccessStatusCode)
-                    return (true, data?["result"] ?? data, null, null);
+                    return (true, data?["result"] ?? data, null, null, TimeSpan.Zero);
                 // 오류 본문에서 메시지/코드 추출(BFF 봉투 형태가 다양할 수 있어 방어적으로).
                 var err = data?["error"] as JObject;
                 var msg = err?.Value<string>("message") ?? data?.Value<string>("message") ?? Trunc(text);
                 var code = err?.Value<string>("code") ?? data?.Value<string>("code") ?? ((int)resp.StatusCode).ToString();
-                return (false, null, msg, code);
+                if ((int)resp.StatusCode == 429) code = "429";
+                if ((int)resp.StatusCode >= 500) code = "ORDER_STATE_UNKNOWN";
+                return (false, null, msg, code, resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(1));
             }
         }
 
@@ -357,7 +377,7 @@ namespace MyTrading.Toss
             };
             if (!string.IsNullOrEmpty(clientOrderId)) body["clientOrderId"] = clientOrderId;
             if (!isMarket) body["price"] = ((long)Math.Round(price)).ToString(CultureInfo.InvariantCulture);
-            return SendOrder(HttpMethod.Post, TossConstants.PathOrders, body.ToString());
+            return SendOrder(TossConstants.PathOrders, body.ToString(), !string.IsNullOrEmpty(clientOrderId));
         }
 
         /// <summary>주문 정정(가격/수량). KR은 quantity 필수.</summary>
@@ -369,18 +389,18 @@ namespace MyTrading.Toss
                 ["quantity"] = qty.ToString(CultureInfo.InvariantCulture),
             };
             if (!isMarket) body["price"] = ((long)Math.Round(price)).ToString(CultureInfo.InvariantCulture);
-            return SendOrder(HttpMethod.Post, TossConstants.PathOrderModify(orderId), body.ToString());
+            return SendOrder(TossConstants.PathOrderModify(orderId), body.ToString(), false);
         }
 
         /// <summary>주문 취소.</summary>
         public TossOrderResult CancelOrder(string orderId)
         {
-            return SendOrder(HttpMethod.Post, TossConstants.PathOrderCancel(orderId), "{}");
+            return SendOrder(TossConstants.PathOrderCancel(orderId), "{}", false);
         }
 
         /// <summary>주문 전송 공통 — 페이싱 + 429/일시오류 백오프 재시도. 실패해도 예외 없이 Ok=false 반환
         /// (전송오류 1건이 라이브 전체를 RuntimeError로 종료시키지 않게 — KIS 어댑터와 동일 정책).</summary>
-        private TossOrderResult SendOrder(HttpMethod method, string path, string body)
+        private TossOrderResult SendOrder(string path, string body, bool idempotent)
         {
             lock (_orderGate)
             {
@@ -392,9 +412,10 @@ namespace MyTrading.Toss
                     TossOrderResult last = null;
                     for (var attempt = 1; attempt <= OrderMaxAttempts; attempt++)
                     {
+                        var delay = TimeSpan.FromMilliseconds(300 * attempt);
                         try
                         {
-                            var (ok, result, msg, code) = PostJson(path, body, true);
+                            var (ok, result, msg, code, retryAfter) = PostJson(path, body, true);
                             last = new TossOrderResult
                             {
                                 Ok = ok,
@@ -402,22 +423,60 @@ namespace MyTrading.Toss
                                 Message = msg,
                                 Code = code,
                             };
-                            if (ok) return last;
-                            // 레이트리밋(429)만 백오프 후 재시도; 그 외 거부(잔고부족 등)는 즉시 반환.
-                            if (code != "429" || attempt == OrderMaxAttempts) return last;
+                            if (ok && !string.IsNullOrEmpty(last.OrderId)) return last;
+                            if (ok) last = UnknownOrder();
+                            // HTTP 상태로 429를 판정한다. 오류 본문의 code는 숫자가 아닌 문자열이다.
+                            if (code == "429") delay = retryAfter > delay ? retryAfter : delay;
+                            else if (!idempotent || last.Code != "ORDER_STATE_UNKNOWN") return last;
+                            if (attempt == OrderMaxAttempts || delay >= TimeSpan.FromMinutes(1)) return last;
                         }
-                        catch (Exception e)
+                        catch (Exception)
                         {
-                            Log.Trace($"TossRestClient.SendOrder: 전송 오류({attempt}/{OrderMaxAttempts}): {e.Message}");
-                            last = new TossOrderResult { Ok = false, Code = "TRANSPORT", Message = e.Message };
-                            if (attempt == OrderMaxAttempts) return last;
+                            last = UnknownOrder();
+                            // 정정·취소는 멱등성 키가 없다. 접수 여부가 불명확하면 재전송하지 않는다.
+                            if (!idempotent || attempt == OrderMaxAttempts) return last;
                         }
-                        System.Threading.Thread.Sleep(300 * attempt); // 0.3→0.6→0.9s 백오프
+                        System.Threading.Thread.Sleep(delay);
                     }
                     return last ?? new TossOrderResult { Ok = false, Message = "주문 전송 실패" };
                 }
                 finally { _lastOrderAt = DateTime.UtcNow; }
             }
+        }
+
+        private static TossOrderResult UnknownOrder() => new TossOrderResult
+        {
+            Ok = false, Code = "ORDER_STATE_UNKNOWN",
+            Message = "주문 응답을 확인하지 못했습니다. 증권사 미체결·체결내역 확인이 필요합니다.",
+        };
+
+        public List<TossOrderStatus> GetOpenOrders()
+        {
+            var result = GetResult(TossConstants.PathOrders,
+                new Dictionary<string, string> { ["status"] = "OPEN" }, true) as JObject;
+            var rows = result?["orders"] as JArray;
+            if (rows == null) throw new TossException("미체결 주문 목록을 확인할 수 없습니다.");
+            var orders = new List<TossOrderStatus>();
+            foreach (var row in rows) orders.Add(ParseOrderStatus((JObject)row));
+            return orders;
+        }
+
+        private static TossOrderStatus ParseOrderStatus(JObject order)
+        {
+            var execution = order["execution"] as JObject;
+            DateTimeOffset.TryParse(order.Value<string>("orderedAt"), CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out var orderedAt);
+            return new TossOrderStatus
+            {
+                Found = true, OrderId = order.Value<string>("orderId"),
+                OrderType = order.Value<string>("orderType"), Currency = order.Value<string>("currency"),
+                OrderedAt = orderedAt.UtcDateTime, Quantity = Dec(order["quantity"]), Price = Dec(order["price"]),
+                Status = order.Value<string>("status"), Buy = order.Value<string>("side") == "BUY",
+                Symbol = order.Value<string>("symbol"), FilledQty = Dec(execution?["filledQuantity"]),
+                AvgPrice = Dec(execution?["averageFilledPrice"]),
+                FilledAmount = Dec(execution?["filledAmount"]),
+                Commission = Dec(execution?["commission"]), Tax = Dec(execution?["tax"]),
+            };
         }
 
         /// <summary>주문 상세 — 체결 폴링용. 미존재/오류면 Found=false.</summary>
@@ -427,18 +486,7 @@ namespace MyTrading.Toss
             {
                 var o = GetResult(TossConstants.PathOrder(orderId), null, true) as JObject;
                 if (o == null) return new TossOrderStatus { Found = false };
-                var exec = o["execution"] as JObject;
-                return new TossOrderStatus
-                {
-                    Found = true,
-                    Status = o.Value<string>("status"),
-                    Buy = o.Value<string>("side") == "BUY",
-                    Symbol = o.Value<string>("symbol"),
-                    FilledQty = Dec(exec?["filledQuantity"]),
-                    AvgPrice = Dec(exec?["averageFilledPrice"]),
-                    Commission = Dec(exec?["commission"]),
-                    Tax = Dec(exec?["tax"]),
-                };
+                return ParseOrderStatus(o);
             }
             catch (Exception e)
             {

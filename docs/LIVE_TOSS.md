@@ -116,7 +116,7 @@ scripts/build-adapter.sh toss      # (인자 없이 실행하면 KIS·토스 둘
 DOTNET_ROOT=$HOME/.dotnet dotnet test adapter/MyTrading.Toss.Tests
 
 # 3) 파이썬 클라이언트/브로커/라이브 설정 테스트
-.venv/bin/pytest tests/test_toss.py
+uv run --locked pytest tests/test_toss.py
 ```
 
 ## 실전 수동 검증 절차 (e2e)

@@ -52,6 +52,7 @@ namespace MyTrading.Kis
 
         private KisWebSocketClient _ws;
         private bool _connected;
+        private bool _orderStateUnknown;
         // 부분체결 누적 추적(brokerId=ODNO → 체결수량 합). 풀필/부분 판정용.
         private readonly ConcurrentDictionary<string, int> _filledQty = new ConcurrentDictionary<string, int>();
 
@@ -115,6 +116,7 @@ namespace MyTrading.Kis
         // ── 주문 ───────────────────────────────────────────────────────────
         public override bool PlaceOrder(Order order)
         {
+            if (_orderStateUnknown) return false;
             var ticker = _symbolMapper.GetBrokerageSymbol(order.Symbol);
             var buy = order.Direction == OrderDirection.Buy;
             var isMarket = order.Type == OrderType.Market
@@ -138,7 +140,7 @@ namespace MyTrading.Kis
                 {
                     var msg = $"KIS 주문거부 {res.Code} {res.Message}";
                     OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, msg) { Status = OrderStatus.Invalid });
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderRejected", msg));
+                    ReportOrderFailure(res, msg);
                     return false;
                 }
                 // ODNO를 brokerId로 — 체결통보가 이 번호로 들어온다.
@@ -164,6 +166,11 @@ namespace MyTrading.Kis
         {
             if (_maxOrderAmount > 0)
             {
+                if (price <= 0)
+                {
+                    reason = "주문금액 한도 확인에 필요한 가격이 없습니다.";
+                    return false;
+                }
                 var amount = order.AbsoluteQuantity * (price > 0 ? price : 0m);
                 if (amount > _maxOrderAmount)
                 {
@@ -177,12 +184,14 @@ namespace MyTrading.Kis
 
         public override bool UpdateOrder(Order order)
         {
+            if (_orderStateUnknown) return false;
             var (orgNo, orderNo) = ExtractBrokerIds(order);
             if (string.IsNullOrEmpty(orderNo)) return false;
             try
             {
                 var price = order is LimitOrder lo ? lo.LimitPrice : order.Price;
                 var res = _rest.ReviseCancel(_cano, _acntPrdtCd, orgNo, orderNo, false, (int)order.AbsoluteQuantity, price, false);
+                if (!res.Ok) ReportOrderFailure(res, res.Message);
                 if (res.Ok)
                     OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.UpdateSubmitted });
                 return res.Ok;
@@ -197,11 +206,13 @@ namespace MyTrading.Kis
 
         public override bool CancelOrder(Order order)
         {
+            if (_orderStateUnknown) return false;
             var (orgNo, orderNo) = ExtractBrokerIds(order);
             if (string.IsNullOrEmpty(orderNo)) return false;
             try
             {
                 var res = _rest.ReviseCancel(_cano, _acntPrdtCd, orgNo, orderNo, true, (int)order.AbsoluteQuantity, 0m, true);
+                if (!res.Ok) ReportOrderFailure(res, res.Message);
                 if (res.Ok)
                     OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.Canceled });
                 return res.Ok;
@@ -212,6 +223,15 @@ namespace MyTrading.Kis
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "CancelError", e.Message));
                 return false;
             }
+        }
+
+        private void ReportOrderFailure(KisOrderResult result, string message)
+        {
+            _orderStateUnknown |= result.Code == "ORDER_STATE_UNKNOWN";
+            OnMessage(new BrokerageMessageEvent(
+                _orderStateUnknown ? BrokerageMessageType.Error : BrokerageMessageType.Warning,
+                result.Code ?? "OrderRejected", message));
+            if (_orderStateUnknown) Log.Error("ORDER_STATE_UNKNOWN: 자동매매 중지, 주문내역 확인 필요");
         }
 
         private static (string orgNo, string orderNo) ExtractBrokerIds(Order order)

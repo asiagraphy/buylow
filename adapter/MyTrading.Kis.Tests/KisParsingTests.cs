@@ -201,23 +201,24 @@ namespace MyTrading.Kis.Tests
         }
 
         [Fact]
-        public void OrderCash_retries_on_transport_error_then_succeeds()
+        public void OrderCash_does_not_resend_after_ambiguous_transport_error()
         {
             var h = new OrderHandler { FailFirstHttp = 1 };
             var res = Client(h).OrderCash("12345678", "01", "005930", true, 10, 0m, KisConstants.OrdDvsnMarket);
-            Assert.True(res.Ok);
-            Assert.Equal(2, h.OrderCalls);
+            Assert.False(res.Ok);
+            Assert.Equal("ORDER_STATE_UNKNOWN", res.Code);
+            Assert.Equal(1, h.OrderCalls);
         }
 
         [Fact]
         public void OrderCash_returns_failure_without_throwing_when_exhausted()
         {
-            // 계속 전송오류여도 예외를 던지지 않고 Ok=false(TRANSPORT)를 반환해 알고리즘이 살아있게 한다.
+            // 응답 유실은 거부와 다르다. 주문 중복을 막기 위해 자동 재시도하지 않는다.
             var h = new OrderHandler { FailFirstHttp = 99 };
             var res = Client(h).OrderCash("12345678", "01", "005930", true, 10, 0m, KisConstants.OrdDvsnMarket);
             Assert.False(res.Ok);
-            Assert.Equal("TRANSPORT", res.Code);
-            Assert.Equal(4, h.OrderCalls);     // OrderMaxAttempts 만큼 시도
+            Assert.Equal("ORDER_STATE_UNKNOWN", res.Code);
+            Assert.Equal(1, h.OrderCalls);
         }
     }
 }

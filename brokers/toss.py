@@ -18,8 +18,9 @@ import json
 import os
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # 스레드 안전 토큰버킷은 KIS 클라이언트와 공유한다(병렬 분봉 적재 시 합산 호출률 제한 — 로직 동일).
 from .kis import _TokenBucket
@@ -44,6 +45,7 @@ _CANDLES_PATH = "/api/v1/candles"
 _MAX_CANDLES_PER_CALL = 200
 # 토스 요청 한도 초과 코드(HTTP 429). 짧은 백오프 후 재시도한다.
 RATE_LIMIT_STATUS = 429
+_SEOUL = ZoneInfo("Asia/Seoul")
 
 
 class TossError(RuntimeError):
@@ -163,11 +165,16 @@ class TossClient:
             timeout=10,
         )
         if resp.status_code != 200:
-            raise TossError(f"토큰 발급 실패: HTTP {resp.status_code} {resp.text[:200]}")
+            hint = ""
+            if resp.status_code == 403:
+                hint = " (토스증권 WTS 설정 > Open API > 허용 IP 관리를 확인하세요)"
+            elif resp.status_code == 401:
+                hint = " (Client ID/Secret과 클라이언트 활성 상태를 확인하세요)"
+            raise TossError(f"토큰 발급 실패: HTTP {resp.status_code}{hint}")
         data = resp.json()
         token = data.get("access_token")
         if not token:
-            raise TossError(f"토큰 응답에 access_token 없음: {data}")
+            raise TossError("토큰 응답에 access_token이 없습니다")
         self._token = token
         # expires_in(초) 기준 만료, 10분 여유.
         self._token_exp = time.time() + float(data.get("expires_in", 86400)) - 600
@@ -193,7 +200,7 @@ class TossClient:
                 time.sleep(self._backoff * (2 ** attempt))
                 continue
             if resp.status_code != 200:
-                raise TossError(f"{path} HTTP {resp.status_code} {resp.text[:200]}")
+                raise TossError(f"{path} 조회 실패: HTTP {resp.status_code}")
             data = resp.json()
             return data.get("result", data) if isinstance(data, dict) else data
         raise TossError(f"{path} 요청 한도 재시도 초과(HTTP {RATE_LIMIT_STATUS})")
@@ -237,9 +244,42 @@ class TossClient:
         return self._account_no or ""
 
     # ── 잔고/매수가능 ──────────────────────────────────────────────────────────
+    def prices(self, symbols: list[str]) -> list[dict]:
+        return self._get("/api/v1/prices", {"symbols": ",".join(symbols)})
+
+    def stocks(self, symbols: list[str]) -> list[dict]:
+        return self._get("/api/v1/stocks", {"symbols": ",".join(symbols)})
+
+    def holdings(self) -> dict:
+        """국내·미국 보유 주식과 통화별 요약을 공식 응답 그대로 반환한다."""
+        return self._get(_HOLDINGS_PATH, account=True)
+
+    def buying_power(self, currency: str = "KRW") -> dict:
+        return self._get(_BUYING_POWER_PATH, {"currency": currency}, account=True)
+
+    def orders(self, status: str, day: date | None = None) -> list[dict]:
+        """주문일 기준 목록. 완료 주문은 모든 커서 페이지를 조회한다."""
+        if status not in ("OPEN", "CLOSED"):
+            raise ValueError("주문 상태는 OPEN 또는 CLOSED여야 합니다")
+        parameters = {"status": status, "limit": 100}
+        if day is not None:
+            parameters.update({"from": day.isoformat(), "to": day.isoformat()})
+        rows = []
+        cursors = set()
+        while True:
+            result = self._get("/api/v1/orders", parameters, account=True)
+            rows.extend(result.get("orders") or [])
+            if not result.get("hasNext"):
+                return rows
+            cursor = result.get("nextCursor")
+            if not cursor or cursor in cursors:
+                raise TossError("주문 목록의 다음 페이지 커서가 유효하지 않습니다")
+            cursors.add(cursor)
+            parameters["cursor"] = cursor
+
     def fetch_buying_power(self, currency: str = "KRW") -> int:
         """매수 가능 금액(현금 기준, getBuyingPower). KRW 정수."""
-        result = self._get(_BUYING_POWER_PATH, {"currency": currency}, account=True)
+        result = self.buying_power(currency)
         return int(round(self._num(result.get("cashBuyingPower"))))
 
     def fetch_balance(self) -> dict:
@@ -250,7 +290,7 @@ class TossClient:
         ⚠️ Toss는 KRW/USD를 함께 주며, 여기선 KRX 매매용이라 marketCountry=='KR'만 취한다.
         금액은 종목 단위는 종목 통화 그대로(KR=KRW), 합산 요약은 KRW(.krw) 필드를 쓴다.
         """
-        result = self._get(_HOLDINGS_PATH, account=True)
+        result = self.holdings()
         holdings = []
         for item in (result.get("items") or []):
             if item.get("marketCountry") != "KR":
@@ -300,8 +340,10 @@ class TossClient:
 
         open_ms, close_ms = _ms(open_hhmmss), _ms(close_hhmmss)
         by_ms: dict[int, dict] = {}
-        # before는 '이 시각 이전' 봉만 반환(exclusive) → 마감봉을 포함하려면 마감초+1초로 둔다.
-        before = f"{day.isoformat()}T{close_hhmmss[:2]}:{close_hhmmss[2:4]}:59+09:00"
+        # 토스는 봉 종료 시각, LEAN은 시작 시각을 저장한다. 15:30 단일가 체결은 15:31 봉에 있다.
+        close_time = datetime.fromisoformat(
+            f"{day.isoformat()}T{close_hhmmss[:2]}:{close_hhmmss[2:4]}:{close_hhmmss[4:6]}+09:00")
+        before = (close_time + timedelta(minutes=1, seconds=1)).isoformat()
         for _ in range(8):  # 하루 ~390분/200 = 2회면 충분, 무한루프 방지 상한
             result = self._get(_CANDLES_PATH, {
                 "symbol": ticker, "interval": "1m", "count": _MAX_CANDLES_PER_CALL,
@@ -317,7 +359,7 @@ class TossClient:
                 ts = c.get("timestamp")
                 if not ts:
                     continue
-                dt = datetime.fromisoformat(ts)  # '2026-03-25T09:00:00+09:00' (KST)
+                dt = datetime.fromisoformat(ts).astimezone(_SEOUL) - timedelta(minutes=1)
                 if dt.date() != day:
                     passed_day = True  # 이전 날짜로 넘어감 → 이 종목/날짜는 끝
                     continue
@@ -365,3 +407,51 @@ def from_config(**overrides):
     from orchestrator import config
     cred = config.get_toss_credentials()
     return TossClient(cred["client_id"], cred["client_secret"], **overrides)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """서버·스케줄러·매매 엔진을 시작하지 않는 토스 정보 조회 명령."""
+    import argparse
+    import re
+    import sys
+
+    import requests
+
+    parser = argparse.ArgumentParser(description="토스증권 정보 조회 (JSON 출력)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for command, help_text in (("prices", "현재가"), ("stocks", "종목 기본정보")):
+        command_parser = commands.add_parser(command, help=help_text)
+        command_parser.add_argument("--symbols", required=True, help="쉼표로 구분한 종목 코드, 최대 200개")
+    commands.add_parser("holdings", help="국내·미국 보유 주식과 통화별 평가금액")
+    buying_parser = commands.add_parser("buying-power", help="현금 기준 매수 가능 금액")
+    buying_parser.add_argument("--currency", choices=("KRW", "USD"), default="KRW")
+    args = parser.parse_args(argv)
+    symbols = []
+    if args.command in ("prices", "stocks"):
+        symbols = [symbol.strip() for symbol in args.symbols.split(",")]
+        if not 1 <= len(symbols) <= 200 or any(
+            re.fullmatch(r"[A-Za-z0-9.\-]+", symbol) is None for symbol in symbols
+        ):
+            parser.error("종목 코드는 영문·숫자·점·하이픈으로 구성하며 1~200개를 입력하세요")
+    try:
+        client = from_config()
+        if args.command == "prices":
+            result = client.prices(symbols)
+        elif args.command == "stocks":
+            result = client.stocks(symbols)
+        elif args.command == "holdings":
+            result = client.holdings()
+        else:
+            result = client.buying_power(args.currency)
+    except TossError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except requests.RequestException as error:
+        print(f"토스 API 연결 실패 ({type(error).__name__})", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

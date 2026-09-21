@@ -71,3 +71,26 @@ def test_list_and_get_run(client):
     assert len(c.get("/runs").json()) == 1
     assert c.get("/runs/fake-run-1").json()["run_id"] == "fake-run-1"
     assert c.get("/runs/missing").status_code == 404
+
+
+@pytest.mark.parametrize("broker,adapter", [("kis_demo", "MyTrading.Kis.dll"),
+                                          ("toss", "MyTrading.Toss.dll")])
+def test_restart_uses_selected_broker_adapter(tmp_path, monkeypatch, broker, adapter):
+    from orchestrator import config
+    from orchestrator.lean import environment
+    from unittest.mock import Mock
+
+    config.set_broker(broker)
+    monkeypatch.setattr(config, "live_start_ok", lambda: (True, "ok"))
+    monkeypatch.setattr(config, "get_strategy", lambda: {"signals": {}})
+    monkeypatch.setattr(config, "get_live_universe", lambda: ["005930"])
+    monkeypatch.setattr(environment, "LAUNCHER_OUT", tmp_path)
+    (tmp_path / adapter).touch()
+    manager = Mock()
+    runner = FakeRunner()
+    app = create_app(runner=runner, broker_cache=Mock(), live_manager=manager)
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        manager.enable.assert_called_once()
+        assert manager.enable.call_args.args[0] is runner
+    manager.shutdown.assert_called_once()

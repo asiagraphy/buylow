@@ -6,7 +6,7 @@
 ## Prerequisites
 
 - **.NET 10 SDK** (LEAN targets `net10.0`)
-- **Python 3.11** — LEAN's `pythonnet` runtime uses 3.11 specifically
+- **Python 3.11**, installed with `uv python install 3.11`. LEAN embeds this interpreter.
 - **[uv](https://github.com/astral-sh/uv)** — Python env/dependency manager
 - **git**
 - For the backtest smoke test: a folder of **LEAN-format market data** (see below)
@@ -28,8 +28,8 @@ export PATH="$HOME/.dotnet:$PATH"
 The two runtimes (Python 3.11 + .NET 10) make a native setup fiddly, so the recommended way to
 run buylow — and the **only path we suggest for Windows** — is Docker. The `Dockerfile` is based on
 `python:3.11-slim` (LEAN's pythonnet needs *exactly* 3.11) with the .NET 10 SDK layered on; the image
-build pre-bakes the launcher, the KIS adapter DLL, the NuGet restore (+ `AlgorithmImports` content), and
-the `.leanpy` pandas/numpy venv so the first backtest starts immediately.
+build prepares the launcher, both broker adapters, and NuGet content. `uv sync --locked --no-dev`
+installs the orchestrator and strategy dependencies in one Python 3.11 project environment.
 
 ```bash
 docker compose up -d --build   # → http://127.0.0.1:8420  (BUYLOW_PORT=9000 to change)
@@ -40,7 +40,8 @@ docker compose up -d --build   # → http://127.0.0.1:8420  (BUYLOW_PORT=9000 to
   Docker would create them as directories and the app would crash; we avoid it by mounting dirs only.)
 - **Relocatable state paths**: the three runtime files default to the repo root but honor env overrides so the
   image can funnel them into one mounted dir — `BUYLOW_CONFIG_LOCAL` (`config.py`), `BUYLOW_DB_PATH`
-  (`store.default_db_path`), `BUYLOW_KIS_TOKEN_CACHE` (`brokers/kis.py`). The Dockerfile sets all three under
+  (`store.default_db_path`), `BUYLOW_KIS_TOKEN_CACHE` (`brokers/kis.py`), and `BUYLOW_TOSS_TOKEN_CACHE`
+  (`brokers/toss.py`). The Dockerfile sets these under
   `/app/state`, and `docker-compose.yml` bind-mounts `./state` there. Native runs leave them at the root.
 - **Host binding**: the server defaults to `127.0.0.1` (local-only — it holds trading control). In the
   container that would be unreachable through the port map, so the image sets
@@ -84,7 +85,7 @@ export LEAN_DATA_DIR=/path/to/lean/Data
 ./scripts/run-backtest.sh
 ```
 
-- First run creates a Python 3.11 venv at `.leanpy/` (with pandas/numpy) automatically.
+- `uv run --locked` uses the Python 3.11 project environment, including locked pandas and NumPy.
 - **Exit code 0 means the LEAN integration is healthy.**
 - Run a different strategy:
   ```bash
@@ -97,7 +98,7 @@ LEAN's Python strategies do `from AlgorithmImports import *`, which loads many
 `QuantConnect.*` CLR assemblies. The script sets:
 
 - `PYTHONNET_PYDLL` → the detected `libpython3.11` shared library
-- `PYTHONPATH` → the `.leanpy` site-packages, the `AlgorithmImports.py` directory (shipped
+- `PYTHONPATH` → the uv project site-packages, the `AlgorithmImports.py` directory (shipped
   inside the `QuantConnect.Common` NuGet package's `content/`), and the strategy directory
 
 ### Platform support (env resolution)
@@ -108,11 +109,10 @@ macOS, Linux, **and Windows**:
 - **libpython** — file name differs (`libpython3.11.dylib` / `.so` / `python311.dll`) and so does
   its location (Unix = `sysconfig LIBDIR`; Windows = the interpreter's install root, not `LIBDIR`
   which is `None` there). See `_libpython_filename` / `_resolve_pythonnet_pydll`.
-- **Python 3.11 lookup** — Windows exposes it as `py -3.11` / `python`, not `python3.11`, so
-  `_find_python311` tries OS-specific candidates and verifies the version (returns an argv list so
-  the two-token `py -3.11` works).
-- **venv layout** — `Scripts\python.exe` (Windows) vs `bin/python` (Unix); site-packages via
-  `sysconfig.get_path('purelib')` (note: `site.getsitepackages()[0]` returns the venv root on Windows).
+- **Python selection**: `.python-version` and `requires-python` select Python 3.11 through uv.
+  LEAN uses the current interpreter's shared library and `sysconfig.get_path('purelib')`.
+  A mismatched Python version or missing shared library stops preparation before launch.
+- **NuGet content**: `NUGET_PACKAGES` is honored when locating `AlgorithmImports.py`.
 - **dotnet** — `dotnet.exe` vs `dotnet`; otherwise found on PATH.
 
 macOS/Linux are CI-validated. The per-OS branches (incl. Windows) remain in
@@ -127,25 +127,30 @@ The orchestrator's `LeanRunner` (`orchestrator/lean/`) is the programmatic equiv
 spawns the LEAN process, and parses the results.
 
 ```bash
-LEAN_DATA_DIR=/path/to/lean/Data python -m orchestrator.lean
+LEAN_DATA_DIR=/path/to/lean/Data uv run --locked python -m orchestrator.lean
 # a different strategy + parameters:
-LEAN_DATA_DIR=/path/to/lean/Data python -m orchestrator.lean \
+LEAN_DATA_DIR=/path/to/lean/Data uv run --locked python -m orchestrator.lean \
     --strategy strategies/My.py --algo-type My --param threshold=0.12
 ```
 
 Results land in `runs/<run-id>/` (the LEAN result JSON + `run.log`); summary statistics are
 parsed from stdout. Exit code `0` = the backtest completed. This is the same machinery the
-dashboard/API will call later. (`scripts/run-backtest.sh` remains as a no-Python shell check.)
+dashboard/API uses. `scripts/run-backtest.sh` delegates to this same runner.
+Each process receives its own `--config` file. Live configuration files contain credentials
+and are created with owner-only permissions. Keep the ignored `runs/` directory private.
 
 ## Control API (dashboard backend)
 
 ```bash
-# one-time: create a dev venv and install the orchestrator + dev deps
-uv venv .venv
-uv pip install --python .venv/bin/python -e ".[dev]"
+# Install the locked project environment, including the default dev dependency group.
+uv python install 3.11
+uv sync --locked
+
+# Prepare Python and the .NET launcher without starting the server or placing orders.
+uv run --locked python -m orchestrator.lean --prepare
 
 # run the Control API on 127.0.0.1:8420 (port via BUYLOW_DASHBOARD_PORT)
-LEAN_DATA_DIR=/path/to/lean/Data .venv/bin/python -m orchestrator.api
+LEAN_DATA_DIR=/path/to/lean/Data uv run --locked python -m orchestrator.api
 ```
 
 This also serves the **browser dashboard** at `http://127.0.0.1:8420` (3 chapters: ① 전략 설정 →
@@ -171,11 +176,12 @@ to `config.local.yaml` (gitignored) and fill values, or enter secrets in the das
 
 ```yaml
 # config.local.yaml (gitignored — never committed)
-data_folder: ~/IdeaProjects/Lean/Data   # or ./data
+data_folder: ./data
 dashboard_port: 8420
-scheduler:          # daily 데이터 최신화 (weekday after close, KST) — same as the dashboard button
-  enabled: false    # turn on to auto-update the whole market (OHLCV+flow) daily
-  hour: 18
+scheduler:
+  enabled: false
+  interval_minutes: 30
+  minute_universe: []
 risk:               # global risk management (%, blank = off) — applies to all backtests + live
   stop_loss:        # per-security stop-loss %, e.g. 7
   take_profit:      # per-security take-profit %
@@ -242,13 +248,24 @@ download URL stable across re-uploads.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest            # fast unit + API tests
+uv run --locked pytest               # unit + API tests
 # end-to-end backtest (needs .NET + Python 3.11 + LEAN_DATA_DIR):
-LEAN_DATA_DIR=/path/to/lean/Data .venv/bin/python -m pytest -m integration -o addopts=""
+LEAN_DATA_DIR=/path/to/lean/Data uv run --locked pytest -m integration -o addopts=""
 ```
 
 Per project rule, every feature ships with tests. Integration tests (real LEAN runs) are
 marked `@pytest.mark.integration` and deselected by default so the normal run stays fast.
+
+The macOS runtime check uses generated prices and runs the actual CLI, LEAN engine,
+Python strategy, and fill logging without broker credentials or market-data requests:
+
+```bash
+uv run --locked pytest tests/test_lean_runtime.py -m integration -o addopts=""
+```
+
+The `dev` dependency group is included by default. Use `uv sync --locked --no-dev` for
+application-only installation. Use `uv run --locked --env-file .env ...` when loading local
+environment variables. `uvx` is for standalone tools, not for project tests or the dashboard.
 
 ## Machine-specific notes / gotchas
 

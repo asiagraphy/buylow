@@ -90,12 +90,13 @@ def create_app(runner: LeanRunner | None = None, store: RunStore | None = None,
         모두 준비됐으면 워치독을 통해 라이브를 다시 띄운다. 하나라도 미비면 조용히 건너뛴다
         (사용자가 매매 탭에서 다시 켜면 됨)."""
         try:
-            from ..config import get_live_universe, get_strategy, live_start_ok
+            from ..config import get_broker, get_live_universe, get_strategy, live_start_ok
             ok, _why = live_start_ok()
             if not (ok and get_strategy() is not None and get_live_universe()):
                 return
             from ..lean.environment import LAUNCHER_OUT
-            if not (LAUNCHER_OUT / "MyTrading.Kis.dll").exists():
+            from ..lean.runner import LIVE_ADAPTERS
+            if not (LAUNCHER_OUT / LIVE_ADAPTERS[get_broker()][1]).exists():
                 return
             from ..live_runner import build_live_request
             live_manager.enable(get_runner(), build_live_request)

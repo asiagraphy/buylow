@@ -12,9 +12,8 @@
 종료(terminate→5초 후 kill)한다. run_live는 프로세스가 끝날 때까지 blocking이라 JobManager
 스레드에서 돌리고, terminate하면 wait가 풀려 잡이 정상 종료된다.
 
-⚠️ 재시작 시 기존 미체결 주문 resync는 미구현(GetOpenOrders가 빈 목록). 다만 보유 포지션은 KIS
-잔고조회(GetAccountHoldings)로 실측되므로, RuleAlpha가 실제 보유 기준으로 델타만 거래해
-재시작이 중복 매수를 일으키지는 않는다(LIVE_KIS.md).
+재시작 시 미체결 주문 동기화는 어댑터가 담당한다. 보유 잔고 조회만으로는 중복 주문을
+방지할 수 없으므로 증권사의 미체결 상태도 확인해야 한다.
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ class LiveProcessManager:
         self._runner = None
         self._build_request = None      # () -> RunRequest (매 재시작 시 최신 config로 새로 빌드)
         self._starting = False          # 잡 제출~Popen 사이(중복 spawn 방지)
+        self._generation = 0            # 중지 전에 시작한 작업이 뒤늦게 살아나는 것을 방지
         self._started_at: float | None = None  # 현재 프로세스 시작(monotonic) — 백오프 리셋 판정
         self._next_attempt_at = 0.0     # monotonic 게이트(백오프 동안 재시작 보류)
         self._fail_count = 0
@@ -80,6 +80,7 @@ class LiveProcessManager:
         """자동매매 OFF: desired=OFF(재시작 안 함) + 프로세스 종료. 종료했으면 True."""
         with self._lock:
             self._desired = False
+            self._generation += 1
         return self._kill_proc()
 
     def shutdown(self) -> None:
@@ -88,6 +89,7 @@ class LiveProcessManager:
         self._stop_event.set()
         with self._lock:
             self._desired = False
+            self._generation += 1
         self._kill_proc()
 
     # 하위호환: 기존 start/stop API (테스트·단발 시작용). start는 워치독도 함께 켠다.
@@ -108,19 +110,26 @@ class LiveProcessManager:
             self._started_at = None
         if proc is None or proc.poll() is not None:
             return False
+        self._terminate(proc)
+        return True
+
+    @staticmethod
+    def _terminate(proc) -> None:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        return True
+            proc.wait(timeout=5)
 
-    def _on_proc(self, proc) -> None:
-        # run_live가 Popen 직후 호출 — 핸들 보관 + 시작시각 기록 + starting 해제.
+    def _on_proc(self, proc, generation) -> None:
         with self._lock:
-            self._proc = proc
-            self._started_at = time.monotonic()
-            self._starting = False
+            accepted = self._desired and generation == self._generation
+            if accepted:
+                self._proc = proc
+                self._started_at = time.monotonic()
+        if not accepted:
+            self._terminate(proc)
 
     def _backoff(self) -> float:
         n = min(self._fail_count, 6)
@@ -176,9 +185,10 @@ class LiveProcessManager:
 
     def _spawn(self) -> str | None:
         with self._lock:
-            if self._starting or (self._proc is not None and self._proc.poll() is None):
+            if not self._desired or self._starting or (self._proc is not None and self._proc.poll() is None):
                 return None
             self._starting = True
+            generation = self._generation
             runner = self._runner
             build = self._build_request
 
@@ -188,10 +198,21 @@ class LiveProcessManager:
                 job.log_path = str(log_path)
             try:
                 req = build()  # 최신 config로 spec 재구성(유니버스/전략 변경 반영)
-                return runner.run_live(req, on_start=on_start, proc_sink=self._on_proc)
+                with self._lock:
+                    if not self._desired or generation != self._generation:
+                        return None
+                result = runner.run_live(req, on_start=on_start,
+                                         proc_sink=lambda proc: self._on_proc(proc, generation))
+                if getattr(result, "stop_reason", None):
+                    with self._lock:
+                        self._desired = False
+                        self._last_error = result.stop_reason
+                return result
             except Exception as e:
                 with self._lock:
                     self._last_error = f"라이브 시작/실행 실패: {type(e).__name__}: {e}"
+                    self._fail_count += 1
+                    self._next_attempt_at = time.monotonic() + self._backoff()
                 raise
             finally:
                 with self._lock:
@@ -199,7 +220,8 @@ class LiveProcessManager:
 
         job = self._jobs.submit("라이브 자동매매", _job)
         with self._lock:
-            self._job_id = job.id
+            if self._desired and generation == self._generation:
+                self._job_id = job.id
         return job.id
 
 

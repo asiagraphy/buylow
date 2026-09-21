@@ -1,6 +1,9 @@
 """LeanRunner의 순수 로직 단위 테스트 (LEAN/.NET 없이 빠르게)."""
 
 import os
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -93,6 +96,42 @@ def test_run_result_success_only_on_zero_exit(tmp_path):
     bad = RunResult("r", 1, {}, tmp_path, tmp_path / "run.log", None)
     assert ok.success is True
     assert bad.success is False
+
+
+def test_backtests_use_distinct_private_configs(tmp_path, monkeypatch):
+    from orchestrator.lean import runner
+
+    calls = []
+
+    class Process:
+        stdout = []
+        returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+    def launch(command, **kwargs):
+        configuration = Path(command[command.index("--config") + 1])
+        calls.append((configuration, json.loads(configuration.read_text())))
+        assert configuration.stat().st_mode & 0o777 == 0o600
+        return Process()
+
+    monkeypatch.setattr(runner, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(runner.subprocess, "Popen", launch)
+    environment = SimpleNamespace(
+        venv_site_packages=tmp_path, algorithm_imports_dir=tmp_path,
+        launcher_dll=tmp_path / "launcher" / "BuylowLauncher.dll",
+        dotnet_exe=tmp_path / "dotnet", process_env=lambda parts: {},
+    )
+    instance = runner.LeanRunner(env=environment)
+    request = RunRequest("strategies/RuleStrategy.py", str(tmp_path))
+    first = instance.run_backtest(request)
+    second = instance.run_backtest(request)
+    assert first.run_id != second.run_id
+    assert calls[0][0].parent == first.run_dir
+    assert calls[1][0].parent == second.run_dir
+    assert calls[0][1]["algorithm-id"] == first.run_id
+    assert not (environment.launcher_dll.parent / "config.json").exists()
 
 
 @pytest.mark.integration

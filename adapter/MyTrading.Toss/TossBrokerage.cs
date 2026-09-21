@@ -4,7 +4,7 @@
  * 역할: LEAN 라이브 엔진이 전략(①선별 + ②타이밍, 백테스트와 동일 코드)이 만든 주문을 이 클래스를 통해
  * 토스로 실제 전송하고, 체결/시세를 받아 LEAN에 되먹인다.
  *
- * ★ KIS 어댑터와 가장 큰 차이 — 토스는 실시간 웹소켓이 없다:
+ * 이 어댑터는 토스의 REST 폴링을 사용한다:
  *   - 체결통보: 웹소켓(KIS H0STCNI0) 대신 **주문 폴링**(getOrder)으로 체결을 확인한다. PlaceOrder가
  *     반환한 orderId를 추적 목록에 넣고, 백그라운드 폴러가 주기적으로 getOrder로 누적 체결수량을 보고
  *     증분만큼 OrderEvent(Fill)를 발생시킨다. 그래서 KIS와 달리 HTS ID가 필요 없다(체결통보 구독이 없음).
@@ -52,6 +52,7 @@ namespace MyTrading.Toss
         private readonly decimal _maxOrderAmount;
 
         private bool _connected;
+        private bool _orderStateUnknown;
         private CancellationTokenSource _cts;
         private Thread _fillPoller;
         private Thread _pricePoller;
@@ -61,7 +62,9 @@ namespace MyTrading.Toss
         private static readonly TimeSpan PricePollInterval = TimeSpan.FromMilliseconds(2000);
 
         // 체결 폴링 추적: orderId(brokerId) → 누적 체결수량(직전 본 값). 증분만 OrderEvent로 발생.
-        private readonly ConcurrentDictionary<string, decimal> _trackedFilled = new ConcurrentDictionary<string, decimal>();
+        private readonly ConcurrentDictionary<string, TossOrderStatus> _trackedFilled = new ConcurrentDictionary<string, TossOrderStatus>();
+        private readonly ConcurrentDictionary<int, string> _clientOrderIds = new ConcurrentDictionary<int, string>();
+        private readonly ConcurrentDictionary<string, string> _replacements = new ConcurrentDictionary<string, string>();
         // 구독 종목(시세 폴링 대상).
         private readonly HashSet<string> _subscribed = new HashSet<string>();
         private readonly object _subLock = new object();
@@ -116,6 +119,7 @@ namespace MyTrading.Toss
         // ── 주문 ───────────────────────────────────────────────────────────
         public override bool PlaceOrder(Order order)
         {
+            if (_orderStateUnknown) return false;
             var ticker = _symbolMapper.GetBrokerageSymbol(order.Symbol);
             var buy = order.Direction == OrderDirection.Buy;
             var isMarket = order.Type == OrderType.Market
@@ -133,17 +137,17 @@ namespace MyTrading.Toss
             try
             {
                 // 멱등성 키: 같은 LEAN 주문의 전송 재시도가 토스에서 중복 주문이 되지 않게 한다.
-                var clientOrderId = "buylow-" + order.Id.ToString(CultureInfo.InvariantCulture);
+                var clientOrderId = _clientOrderIds.GetOrAdd(order.Id, _ => Guid.NewGuid().ToString("N"));
                 var res = _rest.CreateOrder(ticker, buy, (int)order.AbsoluteQuantity, price, isMarket, clientOrderId);
                 if (!res.Ok || string.IsNullOrEmpty(res.OrderId))
                 {
                     var msg = $"토스 주문거부 {res.Code} {res.Message}";
                     OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, msg) { Status = OrderStatus.Invalid });
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderRejected", msg));
+                    ReportOrderFailure(res, msg);
                     return false;
                 }
                 order.BrokerId.Add(res.OrderId);
-                _trackedFilled[res.OrderId] = 0m;  // 폴러가 이 주문의 체결을 추적
+                _trackedFilled[res.OrderId] = new TossOrderStatus();
                 OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.Submitted });
                 Log.Trace($"TossBrokerage.PlaceOrder(): {(buy ? "매수" : "매도")} {ticker} x{order.AbsoluteQuantity} orderId={res.OrderId}");
                 return true;
@@ -162,6 +166,11 @@ namespace MyTrading.Toss
         {
             if (_maxOrderAmount > 0)
             {
+                if (price <= 0)
+                {
+                    reason = "주문금액 한도 확인에 필요한 가격이 없습니다.";
+                    return false;
+                }
                 var amount = order.AbsoluteQuantity * (price > 0 ? price : 0m);
                 if (amount > _maxOrderAmount)
                 {
@@ -175,15 +184,28 @@ namespace MyTrading.Toss
 
         public override bool UpdateOrder(Order order)
         {
-            var orderId = order.BrokerId.FirstOrDefault();
+            if (_orderStateUnknown) return false;
+            var orderId = order.BrokerId.LastOrDefault();
             if (string.IsNullOrEmpty(orderId)) return false;
             try
             {
                 var isMarket = order.Type == OrderType.Market;
                 var price = order is LimitOrder lo ? lo.LimitPrice : order.Price;
+                if (!LimitCheck(order, price, out var reason))
+                {
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderBlocked", reason));
+                    return false;
+                }
                 var res = _rest.ModifyOrder(orderId, (int)order.AbsoluteQuantity, price, isMarket);
+                if (!res.Ok) ReportOrderFailure(res, res.Message);
                 if (res.Ok)
+                {
+                    // 정정 응답은 새 주문번호다. 원주문의 마지막 체결도 종결될 때까지 추적한다.
+                    _replacements[orderId] = res.OrderId;
+                    order.BrokerId.Add(res.OrderId);
+                    _trackedFilled[res.OrderId] = new TossOrderStatus();
                     OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.UpdateSubmitted });
+                }
                 return res.Ok;
             }
             catch (Exception e)
@@ -195,15 +217,17 @@ namespace MyTrading.Toss
 
         public override bool CancelOrder(Order order)
         {
-            var orderId = order.BrokerId.FirstOrDefault();
+            if (_orderStateUnknown) return false;
+            var orderId = order.BrokerId.LastOrDefault();
             if (string.IsNullOrEmpty(orderId)) return false;
             try
             {
                 var res = _rest.CancelOrder(orderId);
+                if (!res.Ok) ReportOrderFailure(res, res.Message);
                 if (res.Ok)
                 {
-                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.Canceled });
-                    _trackedFilled.TryRemove(orderId, out _);
+                    // HTTP 접수 성공과 취소 완료는 다르다. 원주문의 최종 상태와 잔여 체결을 계속 확인한다.
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.CancelPending });
                 }
                 return res.Ok;
             }
@@ -217,8 +241,35 @@ namespace MyTrading.Toss
         // ── 잔고/예수금/주문 ──────────────────────────────────────────────
         public override List<Order> GetOpenOrders()
         {
-            // 라이브 시작 시 기존 미체결 동기화는 미구현(첫 cut, KIS 어댑터와 동일). 빈 상태로 시작.
-            return new List<Order>();
+            var orders = new List<Order>();
+            foreach (var pending in _rest.GetOpenOrders())
+            {
+                if (pending.Currency != "KRW") continue;
+                var remaining = pending.Quantity - pending.FilledQty;
+                if (remaining <= 0) continue;
+                var symbol = _symbolMapper.GetLeanSymbol(pending.Symbol, SecurityType.Equity, TossConstants.KrxMarket);
+                var quantity = pending.Buy ? remaining : -remaining;
+                Order order;
+                if (pending.OrderType == "LIMIT")
+                    order = new LimitOrder(symbol, quantity, pending.Price, pending.OrderedAt);
+                else if (pending.OrderType == "MARKET")
+                    order = new MarketOrder(symbol, quantity, pending.OrderedAt);
+                else throw new TossException("지원하지 않는 미체결 주문 유형입니다.");
+                order.BrokerId.Add(pending.OrderId);
+                order.Status = OrderStatus.Submitted;
+                _trackedFilled[pending.OrderId] = pending;
+                orders.Add(order);
+            }
+            return orders;
+        }
+
+        private void ReportOrderFailure(TossOrderResult result, string message)
+        {
+            _orderStateUnknown |= result.Code == "ORDER_STATE_UNKNOWN";
+            OnMessage(new BrokerageMessageEvent(
+                _orderStateUnknown ? BrokerageMessageType.Error : BrokerageMessageType.Warning,
+                result.Code ?? "OrderRejected", message));
+            if (_orderStateUnknown) Log.Error("ORDER_STATE_UNKNOWN: 자동매매 중지, 주문내역 확인 필요");
         }
 
         public override List<Holding> GetAccountHoldings()
@@ -252,8 +303,8 @@ namespace MyTrading.Toss
                 if (!st.Found) continue;
                 var orders = _algorithm.Transactions.GetOrdersByBrokerageId(orderId);
                 if (orders == null || orders.Count == 0) continue;
-                _trackedFilled.TryGetValue(orderId, out var prevFilled);
-                var delta = st.FilledQty - prevFilled;
+                if (!_trackedFilled.TryGetValue(orderId, out var previous)) continue;
+                var delta = st.FilledQty - previous.FilledQty;
                 var filledStatus = st.Status != null && st.Status.ToUpperInvariant() == "FILLED";
                 foreach (var order in orders)
                 {
@@ -261,14 +312,14 @@ namespace MyTrading.Toss
                     // 전량 체결(FILLED) 시 1회만 반영(부분체결 구간은 0 — 중복 합산 방지).
                     if (delta > 0)
                     {
-                        var fee = filledStatus
-                            ? new OrderFee(new CashAmount(st.Commission + st.Tax, TossConstants.KrwCurrency))
-                            : OrderFee.Zero;
+                        var fee = new OrderFee(new CashAmount(
+                            Math.Max(0, st.Commission + st.Tax - previous.Commission - previous.Tax),
+                            TossConstants.KrwCurrency));
                         OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, fee)
                         {
                             Status = filledStatus ? OrderStatus.Filled : OrderStatus.PartiallyFilled,
                             FillQuantity = st.Buy ? delta : -delta,
-                            FillPrice = st.AvgPrice,
+                            FillPrice = st.FillPriceSince(previous),
                             FillPriceCurrency = TossConstants.KrwCurrency,
                         });
                     }
@@ -277,7 +328,7 @@ namespace MyTrading.Toss
                     //  - FILLED인데 새 증분이 없던 케이스(원자적 업데이트가 어긋난 드문 경우) → 0수량 Filled로 종결
                     if (st.IsTerminal())
                     {
-                        if (!filledStatus)
+                        if (!filledStatus && !(st.Status == "REPLACED" && _replacements.ContainsKey(orderId)))
                             OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
                                 $"토스 주문 종료: {st.Status}") { Status = OrderStatus.Canceled });
                         else if (delta <= 0)
@@ -286,8 +337,12 @@ namespace MyTrading.Toss
                             { Status = OrderStatus.Filled, FillPriceCurrency = TossConstants.KrwCurrency });
                     }
                 }
-                _trackedFilled[orderId] = st.FilledQty;
-                if (st.IsTerminal()) _trackedFilled.TryRemove(orderId, out _);
+                _trackedFilled[orderId] = st;
+                if (st.IsTerminal())
+                {
+                    _trackedFilled.TryRemove(orderId, out _);
+                    _replacements.TryRemove(orderId, out _);
+                }
             }
         }
 

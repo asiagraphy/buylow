@@ -286,12 +286,11 @@ namespace MyTrading.Kis
                             // 레이트리밋(EGW00201) 거부만 백오프 후 재시도; 그 외 거부(잔고부족 등)는 즉시 반환.
                             if (!IsRateLimit(last.Message) || attempt == OrderMaxAttempts) return last;
                         }
-                        catch (Exception e)
+                        catch (Exception)
                         {
-                            // 일시적 전송/파싱 오류(HTTP 타임아웃·연결 끊김 등). 마지막 시도면 실패결과로 반환.
-                            Log.Trace($"KisRestClient.SendOrder: 전송 오류({attempt}/{OrderMaxAttempts}): {e.Message}");
-                            last = new KisOrderResult { Ok = false, Code = "TRANSPORT", Message = e.Message };
-                            if (attempt == OrderMaxAttempts) return last;
+                            // 접수 후 응답만 유실됐을 수 있다. 멱등성 키가 없는 주문은 재전송하지 않는다.
+                            return new KisOrderResult { Ok = false, Code = "ORDER_STATE_UNKNOWN",
+                                Message = "주문 응답을 확인하지 못했습니다. 증권사 미체결·체결내역 확인이 필요합니다." };
                         }
                         System.Threading.Thread.Sleep(300 * attempt); // 0.3→0.6→0.9s 백오프
                     }

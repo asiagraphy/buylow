@@ -242,22 +242,21 @@ docker compose down
 curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
 export DOTNET_ROOT="$HOME/.dotnet" && export PATH="$HOME/.dotnet:$PATH"
 
-# 2) Python 3.11 · git   (macOS: brew / Debian·Ubuntu: apt)
-brew install python@3.11 git                              # macOS
-# sudo apt install -y python3.11 python3.11-venv git      # Linux (Debian·Ubuntu)
-curl -LsSf https://astral.sh/uv/install.sh | sh           # uv
+# 2) uv のインストール（git は別途必要）
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 3) コード + 依存関係
 git clone https://github.com/JeongSeongMok/buylow.git
 cd buylow
-uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev]"
+uv python install 3.11
+uv sync --locked
 
 # 4) ダッシュボードの起動（デフォルトポート 8420）
-.venv/bin/python -m orchestrator.api
-# 別のポートで開くには:  BUYLOW_DASHBOARD_PORT=9000 .venv/bin/python -m orchestrator.api
+uv run --locked python -m orchestrator.api
+# 別のポートで開くには: BUYLOW_DASHBOARD_PORT=9000 uv run --locked python -m orchestrator.api
 
 # 5) （ライブ実取引用 — バックテストのみなら省略可）証券会社アダプタのビルド（KIS・トス）
-dotnet build launcher/BuylowLauncher.csproj -c Release   # 先にランチャーをビルド（NuGet 復元）
+uv run --locked python -m orchestrator.lean --prepare    # Python 確認 + ランチャービルド（注文なし）
 scripts/build-adapter.sh                                  # KIS・トスのアダプタをビルド + DLL をランチャーの隣にコピー
                                                           #   （片方だけ: scripts/build-adapter.sh toss）
 ```
@@ -265,6 +264,12 @@ scripts/build-adapter.sh                                  # KIS・トスのア�
 </details>
 
 起動するとブラウザでダッシュボード（デフォルト `http://127.0.0.1:8420`、上で変更したポートがあればそのポート）にアクセスします。
+
+Python 3.11 と依存関係は `pyproject.toml`・`.python-version`・`uv.lock` で管理します。
+オーケストレータと LEAN 戦略は同じ uv 環境を使うため、手動での有効化は不要です。
+テストは `uv run --locked pytest`、開発依存を除くインストールは `uv sync --locked --no-dev` です。
+`.env` を使う場合は `uv run` に `--env-file .env` を明示してください。
+`uvx` は独立したツール用です。このプロジェクトの実行とテストには `uv run` を使います。
 
 ### キー設定
 

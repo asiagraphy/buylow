@@ -105,7 +105,7 @@ scripts/build-adapter.sh
 DOTNET_ROOT=$HOME/.dotnet dotnet test adapter/MyTrading.Kis.Tests
 
 # 3) 파이썬 라이브 설정/콘피그 생성 테스트
-.venv/bin/pytest tests/test_live.py
+uv run --locked pytest tests/test_live.py
 ```
 
 `build-adapter.sh` is bash-only. On **Windows (PowerShell)** the script step has no shell equivalent,

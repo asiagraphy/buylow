@@ -136,22 +136,22 @@ def _candle(ts, o, h, low, c, v):
 def test_fetch_minute_normalizes_and_orders(tmp_path):
     # 한 페이지에 09:00,09:01만 와서 earliest<=open이라 1회로 종료. 오름차순·ms·time 정규화 확인.
     page = {"result": {"candles": [
-        _candle("2026-06-01T09:01:00+09:00", 101, 102, 100, 101, 5),
-        _candle("2026-06-01T09:00:00+09:00", 100, 101, 99, 100, 7),
-    ], "nextBefore": "2026-06-01T09:00:00+09:00"}}
+        _candle("2026-06-01T09:02:00+09:00", 101, 102, 100, 101, 5),
+        _candle("2026-06-01T09:01:00+09:00", 100, 101, 99, 100, 7),
+    ], "nextBefore": "2026-06-01T09:01:00+09:00"}}
     c = _client(tmp_path, {_CANDLE_ROUTE: page})
     rows = c.fetch_minute("005930", date(2026, 6, 1))
     assert [r["ms"] for r in rows] == [9 * 3600 * 1000, (9 * 3600 + 60) * 1000]
     assert rows[0]["close"] == 100 and rows[0]["volume"] == 7 and isinstance(rows[0]["close"], int)
     assert rows[1]["time"] == "090100"
-    # before 커서는 마감초+1초(마감봉 포함), interval=1m.
+    # 마감 단일가의 15:31 종료 봉까지 포함한다.
     call = c._session.get_calls[0]["params"]
-    assert call["before"] == "2026-06-01T15:30:59+09:00" and call["interval"] == "1m"
+    assert call["before"] == "2026-06-01T15:31:01+09:00" and call["interval"] == "1m"
 
 
 def test_fetch_minute_filters_other_day_and_before_open(tmp_path):
     page = {"result": {"candles": [
-        _candle("2026-06-01T09:00:00+09:00", 1, 1, 1, 1, 1),
+        _candle("2026-06-01T09:01:00+09:00", 1, 1, 1, 1, 1),
         _candle("2026-06-01T08:59:00+09:00", 2, 2, 2, 2, 2),   # 장 시작 전 제외
         _candle("2026-05-29T15:30:00+09:00", 3, 3, 3, 3, 3),   # 다른 날 제외
     ], "nextBefore": None}}
@@ -224,10 +224,47 @@ def test_toss_broker_market_status_regular():
     assert ms["open"] is True and ms["session"] == "regular" and ms["env"] == "real"
 
 
-def test_toss_broker_has_no_trades_method():
-    # Toss는 종료(CLOSED) 주문 조회 미지원 → trades 메서드를 두지 않아 BrokerCache가 자체 거래로그로 폴백.
-    b = TossBroker("cid", "sec", client=FakeTossClient())
-    assert not hasattr(b, "trades")
+def test_toss_trades_includes_partial_canceled_orders():
+    class Client:
+        def orders(self, status, day):
+            assert day == date(2026, 6, 1)
+            return [] if status == "OPEN" else [{
+                "orderId": "closed-1", "symbol": "005930", "side": "BUY", "currency": "KRW",
+                "status": "CANCELED", "orderedAt": "2026-06-01T09:00:00+09:00",
+                "execution": {"filledQuantity": "2", "averageFilledPrice": "70000",
+                              "filledAmount": "140000", "filledAt": "2026-06-01T09:01:00+09:00"},
+            }]
+    broker = TossBroker("cid", "secret", client=Client())
+    rows = broker.trades("2026-06-01")
+    assert len(rows) == 1
+    assert rows[0]["qty"] == 2 and rows[0]["amount"] == 140000
+    assert rows[0]["realized_pnl"] is None
+
+
+def test_orders_reads_all_pages(tmp_path, monkeypatch):
+    client = _client(tmp_path, {})
+    calls = []
+
+    def get(path, parameters, account=False):
+        calls.append(dict(parameters))
+        assert path == "/api/v1/orders" and account
+        if "cursor" not in parameters:
+            return {"orders": [{"orderId": "one"}], "hasNext": True, "nextCursor": "page-two"}
+        return {"orders": [{"orderId": "two"}], "hasNext": False, "nextCursor": None}
+
+    monkeypatch.setattr(client, "_get", get)
+    assert [order["orderId"] for order in client.orders("CLOSED", date(2026, 6, 1))] == ["one", "two"]
+    assert calls[1]["cursor"] == "page-two"
+    assert calls[0]["from"] == "2026-06-01"
+
+
+def test_minute_close_auction_and_utc_timestamp(tmp_path):
+    page = {"result": {"candles": [
+        _candle("2026-06-01T00:01:00Z", 100, 100, 100, 100, 5),
+        _candle("2026-06-01T15:31:00+09:00", 110, 110, 110, 110, 10),
+    ], "nextBefore": None}}
+    rows = _client(tmp_path, {_CANDLE_ROUTE: page}).fetch_minute("005930", date(2026, 6, 1))
+    assert [row["time"] for row in rows] == ["090000", "153000"]
 
 
 # ── config / 라이브 배선 (conftest의 _isolate_config가 config.local.yaml을 격리) ──────

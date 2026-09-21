@@ -3,6 +3,7 @@
 from orchestrator.live_runner import LiveProcessManager
 from orchestrator.jobs import JobManager
 import time
+import threading
 
 
 class FakeProc:
@@ -73,6 +74,57 @@ def test_stop_when_not_running_returns_false():
     assert mgr.stop() is False
 
 
+def test_stop_during_startup_terminates_late_process():
+    entered = threading.Event()
+    release = threading.Event()
+    proc = FakeProc()
+
+    class DelayedRunner(FakeRunner):
+        def run_live(self, request, on_start=None, proc_sink=None):
+            entered.set()
+            assert release.wait(2)
+            return super().run_live(request, on_start, proc_sink)
+
+    manager = LiveProcessManager(JobManager(), poll_interval=0.01)
+    try:
+        manager.enable(DelayedRunner(proc), lambda: object())
+        assert entered.wait(2)
+        manager.disable()
+        release.set()
+        assert _wait(lambda: proc.terminated)
+        assert not manager.is_running()
+        assert manager.status()["desired"] is False
+    finally:
+        release.set()
+        manager.shutdown()
+
+
+def test_reenable_does_not_adopt_process_from_stopped_startup():
+    entered = threading.Event()
+    release = threading.Event()
+    stopped_proc = FakeProc()
+    current_proc = FakeProc()
+
+    class DelayedRunner(FakeRunner):
+        def run_live(self, request, on_start=None, proc_sink=None):
+            entered.set()
+            assert release.wait(2)
+            return super().run_live(request, on_start, proc_sink)
+
+    manager = LiveProcessManager(JobManager(), poll_interval=0.01)
+    try:
+        manager.enable(DelayedRunner(stopped_proc), lambda: object())
+        assert entered.wait(2)
+        manager.disable()
+        manager.enable(FakeRunner(current_proc), lambda: object())
+        release.set()
+        assert _wait(lambda: stopped_proc.terminated and manager.is_running())
+        assert not current_proc.terminated
+    finally:
+        release.set()
+        manager.shutdown()
+
+
 # ── 워치독(감독 스레드) — 운영 안정성 ──────────────────────────────────────
 class DyingRunner:
     """run_live가 proc를 잠깐 살리고 스스로 죽는 것(크래시)을 흉내. 호출 횟수를 센다."""
@@ -124,6 +176,25 @@ def test_failing_build_records_error_and_does_not_run():
     assert _wait(lambda: mgr.status()["last_error"] is not None, timeout=2.0)
     assert mgr.is_running() is False
     mgr.disable()
+
+
+def test_startup_failure_observes_backoff():
+    attempts = []
+
+    def failing_build():
+        attempts.append(time.monotonic())
+        raise RuntimeError("missing strategy")
+
+    manager = LiveProcessManager(JobManager(), poll_interval=0.01, base_backoff=10)
+    try:
+        manager.enable(None, failing_build)
+        assert _wait(lambda: manager.status()["last_error"] is not None)
+        for _ in range(10):
+            manager._tick()
+        assert len(attempts) == 1
+        assert manager.status()["fail_count"] == 1
+    finally:
+        manager.shutdown()
 
 
 # ── build_live_request — 최신 config로 라이브 spec 구성 ──────────────────────

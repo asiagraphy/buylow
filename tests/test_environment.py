@@ -1,11 +1,6 @@
-"""LEAN 런타임 환경 해석의 크로스플랫폼(특히 Windows) 분기 단위테스트.
+"""uv 프로젝트 인터프리터와 LEAN 공유 라이브러리의 일치 검증."""
 
-실제 인터프리터/DLL 해석은 OS에 의존하므로, 순수 분기 함수(파일명·argv·venv 경로)를
-플랫폼 인자/모킹으로 검증한다. 현재 OS에서의 실제 해석은 integration으로 따로 확인.
-"""
-
-import subprocess
-import sys
+from pathlib import Path
 
 import pytest
 
@@ -30,53 +25,52 @@ def test_dotnet_exe_name_per_platform():
     assert env._dotnet_exe_name("linux") == "dotnet"
 
 
-def test_venv_python_relpath_per_platform():
-    # Windows는 Scripts\python.exe, 그 외 bin/python.
-    assert env._venv_python_relpath("win32").parts == ("Scripts", "python.exe")
-    assert env._venv_python_relpath("darwin").parts == ("bin", "python")
-    assert env._venv_python_relpath("linux").parts == ("bin", "python")
-
-
-# ── _find_python311: OS별 후보 순서 + 버전 검증 ───────────────────────────────
-def _fake_run_version(ver: str):
-    """argv -c ... 호출에 버전 문자열을 돌려주는 가짜 subprocess.run."""
-    def run(argv, capture_output=False, text=False, check=False, **kw):
-        return subprocess.CompletedProcess(argv, 0, stdout=ver + "\n", stderr="")
-    return run
-
-
-def test_find_python311_windows_prefers_py_launcher(monkeypatch):
+def test_shared_library_uses_windows_base_interpreter(tmp_path, monkeypatch):
+    library = tmp_path / "python311.dll"
+    library.touch()
     monkeypatch.setattr(env.sys, "platform", "win32")
-    # py 런처만 존재한다고 가정.
-    monkeypatch.setattr(env.shutil, "which",
-                        lambda name: r"C:\Windows\py.exe" if name == "py" else None)
-    monkeypatch.setattr(env.subprocess, "run", _fake_run_version("3.11"))
-    argv = env._find_python311()
-    # 'py -3.11' → 2토큰 argv로 반환되어야 한다(분봉/백테 호출이 [*argv, '-c', ...]로 펼침).
-    assert argv == [r"C:\Windows\py.exe", "-3.11"]
+    monkeypatch.setattr(env.sys, "base_prefix", str(tmp_path))
+    assert env._resolve_pythonnet_pydll() == library
 
 
-def test_find_python311_unix_uses_python311(monkeypatch):
+def test_shared_library_uses_current_interpreter_sysconfig(tmp_path, monkeypatch):
+    library = tmp_path / "libpython3.11.so.1.0"
+    library.touch()
     monkeypatch.setattr(env.sys, "platform", "linux")
-    monkeypatch.setattr(env.shutil, "which",
-                        lambda name: "/usr/bin/python3.11" if name == "python3.11" else None)
-    monkeypatch.setattr(env.subprocess, "run", _fake_run_version("3.11"))
-    assert env._find_python311() == ["/usr/bin/python3.11"]
+    variables = {"LIBDIR": str(tmp_path), "LDLIBRARY": library.name}
+    monkeypatch.setattr(env.sysconfig, "get_config_var", variables.get)
+    monkeypatch.setattr(env.shutil, "which", lambda name: None)
+    assert env._resolve_pythonnet_pydll() == library
 
 
-def test_find_python311_skips_wrong_version(monkeypatch):
-    monkeypatch.setattr(env.sys, "platform", "linux")
-    monkeypatch.setattr(env.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(env.subprocess, "run", _fake_run_version("3.12"))  # 전부 3.12
-    with pytest.raises(RuntimeError, match="3.11"):
-        env._find_python311()
+def test_shared_library_rejects_wrong_python(monkeypatch):
+    monkeypatch.setattr(env.sys, "version_info", (3, 12, 0))
+    with pytest.raises(RuntimeError, match="uv run"):
+        env._resolve_pythonnet_pydll()
 
 
-def test_find_python311_error_hint_is_os_specific(monkeypatch):
+def test_missing_shared_library_fails_before_launch(tmp_path, monkeypatch):
     monkeypatch.setattr(env.sys, "platform", "win32")
-    monkeypatch.setattr(env.shutil, "which", lambda name: None)  # 아무것도 없음
-    with pytest.raises(RuntimeError, match="winget"):
-        env._find_python311()
+    monkeypatch.setattr(env.sys, "base_prefix", str(tmp_path))
+    with pytest.raises(RuntimeError, match="공유 라이브러리"):
+        env._resolve_pythonnet_pydll()
+
+
+def test_lean_uses_project_dependencies():
+    import numpy
+    import pandas
+
+    packages = env._project_site_packages().resolve()
+    assert Path(numpy.__file__).resolve().is_relative_to(packages)
+    assert Path(pandas.__file__).resolve().is_relative_to(packages)
+
+
+def test_algorithm_imports_honors_nuget_packages(tmp_path, monkeypatch):
+    content = tmp_path / "quantconnect.common" / env.LEAN_PKG_VERSION / "content"
+    content.mkdir(parents=True)
+    (content / "AlgorithmImports.py").touch()
+    monkeypatch.setenv("NUGET_PACKAGES", str(tmp_path))
+    assert env._resolve_algorithm_imports() == content
 
 
 # ── 현재 OS에서의 실제 해석(integration) ──────────────────────────────────────
@@ -85,4 +79,6 @@ def test_resolve_pythonnet_pydll_on_this_os():
     # 개발 머신(3.11 설치돼 있어야)에서 실제 libpython 경로가 잡히는지.
     pydll = env._resolve_pythonnet_pydll()
     assert pydll.exists()
-    assert pydll.name == env._libpython_filename()
+    import ctypes
+
+    assert ctypes.PyDLL(str(pydll)) is not None

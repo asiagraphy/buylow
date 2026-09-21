@@ -17,6 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from ..config import get_risk_config
 from .environment import REPO_ROOT, LeanEnvironment, prepare_environment
@@ -70,6 +71,7 @@ class RunResult:
     run_dir: Path
     log_path: Path
     result_json: Path | None
+    stop_reason: str | None = None
 
     @property
     def success(self) -> bool:
@@ -294,7 +296,7 @@ class LeanRunner:
             raise FileNotFoundError(f"데이터 폴더 없음: {data_folder}")
 
         algo_type = request.resolved_algorithm_type()
-        run_id = f"{algo_type}-{datetime.now():%Y%m%d-%H%M%S}"
+        run_id = f"{algo_type}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
         run_dir = RUNS_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -308,10 +310,10 @@ class LeanRunner:
         ]
         proc_env = self._env.process_env(pythonpath_parts)
 
-        # config는 LEAN이 cwd에서 읽으므로 런처 출력폴더에 쓴다. 결과물은 run_dir로 분리.
+        # 동시 작업이 서로의 설정을 읽지 않도록 실행별 설정 경로를 명시한다.
         out_dir = self._env.launcher_dll.parent
         config = _build_config(request, run_dir, run_id)
-        (out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+        config_path = _write_run_config(run_dir, config)
 
         log_path = run_dir / "run.log"
         if on_start:
@@ -320,7 +322,7 @@ class LeanRunner:
         # buffering=1(라인 버퍼) → 실행 중에도 로그가 즉시 파일에 기록돼 대시보드에서 실시간 확인 가능
         with open(log_path, "w", encoding="utf-8", buffering=1) as log:
             proc = subprocess.Popen(
-                [str(self._env.dotnet_exe), "BuylowLauncher.dll"],
+                [str(self._env.dotnet_exe), "BuylowLauncher.dll", "--config", str(config_path)],
                 cwd=str(out_dir),
                 env=proc_env,
                 stdout=subprocess.PIPE,
@@ -382,7 +384,7 @@ class LeanRunner:
                 f"라이브 어댑터 DLL이 없음: {adapter_dll} — 'scripts/build-adapter.sh'로 먼저 빌드하세요")
 
         algo_type = request.resolved_algorithm_type()
-        run_id = f"live-{algo_type}-{datetime.now():%Y%m%d-%H%M%S}"
+        run_id = f"live-{algo_type}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
         run_dir = RUNS_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -397,7 +399,7 @@ class LeanRunner:
             cfg = build_live_config(request, run_dir, run_id, live=live,
                                     kis=config.get_kis_credentials(),
                                     token_cache=str(DEFAULT_TOKEN_CACHE))
-        (out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        config_path = _write_run_config(run_dir, cfg)
 
         pythonpath_parts = [
             str(self._env.venv_site_packages),
@@ -410,9 +412,10 @@ class LeanRunner:
         log_path = run_dir / "run.log"
         if on_start:
             on_start(run_id, log_path)
+        stop_reason = None
         with open(log_path, "w", encoding="utf-8", buffering=1) as log:
             proc = subprocess.Popen(
-                [str(self._env.dotnet_exe), "BuylowLauncher.dll"],
+                [str(self._env.dotnet_exe), "BuylowLauncher.dll", "--config", str(config_path)],
                 cwd=str(out_dir), env=proc_env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             )
@@ -421,10 +424,23 @@ class LeanRunner:
             assert proc.stdout is not None
             for line in proc.stdout:
                 log.write(line)
+                if "ORDER_STATE_UNKNOWN" in line and stop_reason is None:
+                    stop_reason = "주문 접수 여부가 불명확합니다. 증권사 주문내역 확인 후 다시 시작하세요."
+                    config.set_live_enabled(False)
+                    proc.terminate()
             proc.wait()
 
         return RunResult(run_id=run_id, exit_code=proc.returncode, statistics={},
-                         run_dir=run_dir, log_path=log_path, result_json=None)
+                         run_dir=run_dir, log_path=log_path, result_json=None, stop_reason=stop_reason)
+
+
+def _write_run_config(run_dir: Path, configuration: dict) -> Path:
+    # 라이브 설정에는 증권사 키가 있으므로 생성 시점부터 소유자만 읽을 수 있게 한다.
+    path = run_dir / "config.json"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(configuration, stream, indent=2)
+    return path
 
 
 def _parse_param(item: str) -> tuple[str, str]:
@@ -441,6 +457,7 @@ def main() -> int:
         description="LEAN 백테스트 실행 (오케스트레이터 Runner)",
     )
     parser.add_argument("--strategy", default="strategies/SmokeTestAlgorithm.py")
+    parser.add_argument("--prepare", action="store_true", help="런타임과 런처만 준비하고 종료(주문 없음)")
     parser.add_argument("--algo-type", default=None, help="클래스명 (기본: 파일명)")
     parser.add_argument(
         "--data-folder", default=os.environ.get("LEAN_DATA_DIR"),
@@ -449,6 +466,11 @@ def main() -> int:
     parser.add_argument("--param", action="append", default=[], type=_parse_param,
                         help="전략 파라미터 key=value (반복 가능)")
     args = parser.parse_args()
+
+    if args.prepare:
+        prepare_environment()
+        print("LEAN Python 3.11 런타임과 런처 준비 완료")
+        return 0
 
     if not args.data_folder:
         parser.error("데이터 폴더를 --data-folder 또는 LEAN_DATA_DIR로 지정하세요")

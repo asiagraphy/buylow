@@ -22,8 +22,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-LEAN_PKG_VERSION="2.5.17757"   # net10 호환 계보. docs/DEVELOPMENT.md 참고 (10730.x 금지)
-
 # --- .NET ---
 export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
 export PATH="$DOTNET_ROOT:$PATH"
@@ -40,45 +38,8 @@ STRATEGY="${STRATEGY:-strategies/SmokeTestAlgorithm.py}"
 STRATEGY_ABS="$(cd "$(dirname "$STRATEGY")" && pwd)/$(basename "$STRATEGY")"
 [ -f "$STRATEGY_ABS" ] || { echo "ERROR: 전략 파일 없음: $STRATEGY_ABS"; exit 1; }
 ALGO_TYPE="${ALGO_TYPE:-$(basename "$STRATEGY" .py)}"
-STRATEGY_DIR="$(dirname "$STRATEGY_ABS")"
 
-# --- Python 3.11 런타임 (LEAN pythonnet은 3.11 사용) ---
-command -v python3.11 >/dev/null || { echo "ERROR: python3.11 없음 (예: 'brew install python@3.11')"; exit 1; }
-PY_LIBDIR="$(python3.11 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-export PYTHONNET_PYDLL="$PY_LIBDIR/libpython3.11.dylib"
-[ -f "$PYTHONNET_PYDLL" ] || { echo "ERROR: libpython3.11 못 찾음: $PYTHONNET_PYDLL"; exit 1; }
-
-# LEAN Python 연동에 필요한 pandas/numpy를 담은 전용 venv (없으면 생성)
-LEANPY="$REPO_ROOT/.leanpy"
-if [ ! -x "$LEANPY/bin/python" ]; then
-  echo ">> LEAN Python 런타임 venv 생성 ($LEANPY)"
-  uv venv --python 3.11 "$LEANPY"
-  uv pip install --python "$LEANPY/bin/python" pandas numpy
-fi
-SITE_PACKAGES="$("$LEANPY/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
-
-# --- 빌드 ---
-echo ">> 런처 빌드"
-dotnet build "$REPO_ROOT/launcher/BuylowLauncher.csproj" -c Release --nologo -v quiet
-OUT="$REPO_ROOT/launcher/bin/Release/net10.0"
-
-# AlgorithmImports.py 는 QuantConnect.Common NuGet content에 들어있음 → PYTHONPATH에 추가
-AI_DIR="$HOME/.nuget/packages/quantconnect.common/$LEAN_PKG_VERSION/content"
-[ -f "$AI_DIR/AlgorithmImports.py" ] || { echo "ERROR: AlgorithmImports.py 못 찾음: $AI_DIR"; exit 1; }
-
-# 'from AlgorithmImports import *' + 전략 import 해소
-export PYTHONPATH="$SITE_PACKAGES:$AI_DIR:$STRATEGY_DIR"
-
-# --- config 렌더링 (placeholder 치환) ---
-RUN_CONFIG="$OUT/config.json"
-sed -e "s#__ALGORITHM_TYPE__#$ALGO_TYPE#g" \
-    -e "s#__ALGORITHM_LOCATION__#$STRATEGY_ABS#g" \
-    -e "s#__DATA_FOLDER__#$DATA_FOLDER#g" \
-    "$REPO_ROOT/launcher/config.json" > "$RUN_CONFIG"
-
-# --- 실행 ---
-echo ">> 백테스트 실행: $ALGO_TYPE ($STRATEGY_ABS)"
-echo "   data-folder=$DATA_FOLDER  python=3.11  lean=$LEAN_PKG_VERSION"
-echo "----------------------------------------------------------------"
-cd "$OUT"
-dotnet BuylowLauncher.dll
+# 대시보드와 같은 실행 경로를 사용해 Python·의존성·설정 해석을 일치시킨다.
+command -v uv >/dev/null || { echo "ERROR: uv 설치 필요"; exit 1; }
+exec uv run --locked python -m orchestrator.lean \
+    --strategy "$STRATEGY_ABS" --algo-type "$ALGO_TYPE" --data-folder "$DATA_FOLDER" "$@"

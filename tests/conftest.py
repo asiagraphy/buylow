@@ -17,3 +17,9 @@ def _isolate_config(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("LEAN_DATA_DIR", raising=False)
     monkeypatch.delenv("BUYLOW_DASHBOARD_PORT", raising=False)
     monkeypatch.delenv("BUYLOW_BROKER", raising=False)
+    for key in ("BUYLOW_LIVE_ENABLED", "BUYLOW_LIVE_MAX_ORDER_AMOUNT"):
+        monkeypatch.delenv(key, raising=False)
+    from orchestrator.persistence import store, trade_store
+    database = tmp_path_factory.mktemp("db") / "buylow.db"
+    monkeypatch.setattr(store, "default_db_path", lambda: database)
+    monkeypatch.setattr(trade_store, "default_trade_db_path", lambda: database)

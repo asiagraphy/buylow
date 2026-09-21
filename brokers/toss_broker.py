@@ -5,14 +5,13 @@ C# 어댑터(adapter/MyTrading.Toss)가 집행하고, 이 클래스는 '조회'�
 
 KisBroker와의 차이:
 - 모의투자 env가 없다(실전 단일).
-- **trades(체결내역) 메서드가 없다** — Toss는 종료(CLOSED) 주문 조회를 아직 미지원하므로 계좌
-  체결내역을 줄 수 없다. 매매 탭은 이 메서드가 없으면 buylow 자체 거래로그(TradeStore)로 폴백한다
-  (brokers/base.py 설계). 메서드를 일부러 두지 않아 BrokerCache가 폴백 경로를 타게 한다.
+- 체결은 OPEN·CLOSED 주문의 누적 체결량을 사용한다. REST 조회는 개별 체결 이벤트가 아니라
+  주문별 합계이며, 날짜 필터는 주문 생성일 기준이다.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from .base import mask_account
@@ -87,3 +86,27 @@ class TossBroker:
             "env": "real",
             "as_of": now.strftime("%Y-%m-%d %H:%M"),
         }
+
+    def trades(self, date_iso: str) -> list[dict]:
+        day = date.fromisoformat(date_iso)
+        orders = {}
+        for status in ("OPEN", "CLOSED"):
+            for order in self._client.orders(status, day):
+                orders[order["orderId"]] = order
+        rows = []
+        for order in orders.values():
+            if order.get("currency") != "KRW":
+                continue
+            execution = order.get("execution") or {}
+            quantity = int(float(execution.get("filledQuantity") or 0))
+            if quantity <= 0:
+                continue
+            price = float(execution.get("averageFilledPrice") or 0)
+            rows.append({
+                "ts": execution.get("filledAt") or order["orderedAt"],
+                "ticker": order["symbol"], "name": "", "side": order["side"],
+                "qty": quantity, "price": price,
+                "amount": float(execution.get("filledAmount") or quantity * price),
+                "realized_pnl": None, "reason": "주문별 누적체결 (주문일 기준)",
+            })
+        return sorted(rows, key=lambda row: row["ts"])
