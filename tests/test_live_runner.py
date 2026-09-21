@@ -197,6 +197,29 @@ def test_startup_failure_observes_backoff():
         manager.shutdown()
 
 
+def test_uncertain_order_result_disables_automatic_restart():
+    from types import SimpleNamespace
+
+    class Runner:
+        calls = 0
+
+        def run_live(self, request, on_start=None, proc_sink=None):
+            self.calls += 1
+            return SimpleNamespace(stop_reason="주문 접수 여부 확인 필요")
+
+    runner = Runner()
+    manager = LiveProcessManager(JobManager(), poll_interval=0.01)
+    try:
+        manager.enable(runner, lambda: object())
+        assert _wait(lambda: not manager.status()["desired"])
+        for _ in range(10):
+            manager._tick()
+        assert runner.calls == 1
+        assert "확인" in manager.status()["last_error"]
+    finally:
+        manager.shutdown()
+
+
 # ── build_live_request — 최신 config로 라이브 spec 구성 ──────────────────────
 def test_build_live_request_requires_strategy_and_universe():
     import pytest

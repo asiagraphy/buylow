@@ -124,10 +124,10 @@ All data is managed on the **Data tab of the dashboard**.
 
 - Turn on automated trading on the **Trade tab** and it places real orders using your saved strategy + target tickers (turn it off to stop). KIS and Toss share the same screen and the same strategy code.
 - Buys follow the strategy and timing; exits follow signals/risk — the same code as backtest.
-- **Account monitoring** — deposit / buyable amount / holdings (buy price / current price / P&L), market-open/close status, trade history (KIS uses execution inquiry, Toss uses buylow's own trade log; auto-refreshed every 10 seconds).
+- **Account monitoring**: deposits, buying power, holdings, market status, and trade history refresh every 10 seconds. KIS uses execution inquiry; Toss uses cumulative fills per order.
 - **Today's selection** — previews which tickers would be bought/sold based on the saved strategy, target tickers, and current holdings (reproduces the once-a-day previous-close selection exactly).
 - Automated trading is **off** by default; once on, it places orders immediately per the saved strategy. For the full live procedure see [docs/LIVE_KIS.md](./docs/LIVE_KIS.md) (KIS) · [docs/LIVE_TOSS.md](./docs/LIVE_TOSS.md) (Toss).
-- **Operational resilience** — while automated trading is on, it resumes automatically if the server restarts (deploy/reboot), and if the live process exits unexpectedly it is restarted automatically after a short backoff. When orders bunch up (e.g., at the open), submissions are paced to the broker's per-second order limit and transient errors are retried, so a single order's failure never halts the whole bot.
+- **Process control**: enabled trading resumes after server restart. Stopping during startup also terminates a late process. An unknown order outcome disables trading and automatic restart; verify broker order history before manually resuming.
 - ⚠️ **Live requires building the broker adapter DLL once** (the Docker install bakes it into the image automatically; a native install makes it optional since it isn't needed for backtest). If you flip the toggle without building it, you'll see a *"live adapter is missing"* notice — run the adapter-build step in [Setup](#setup) above (`scripts/build-adapter.sh` builds both the KIS and Toss adapters).
 
 ---
@@ -142,7 +142,7 @@ All data is managed on the **Data tab of the dashboard**.
 
 - Pick a broker on the Settings tab and enter its keys; inquiry and live orders then run through that broker.
 - KIS keeps **live and paper app keys/accounts fully separate**, so each is registered and managed independently (same logic, different environment).
-- **Toss Securities** has no paper server (real only); enter just the OAuth2 keys (Client ID/Secret) and the account is resolved automatically (no account number / HTS ID). Lacking a fill-notification WebSocket, the adapter confirms fills by **polling orders**.
+- **Toss Securities** currently has a live adapter only. OAuth2 keys (Client ID/Secret) resolve the account automatically (no account number / HTS ID). The official API supports WebSocket streams; this adapter currently confirms fills by **polling orders**.
 - Trading (balance·orders) and **minute-bar loading run through the chosen broker's API** (KIS = 120 bars/call, ~1y retention; Toss = getCandles, 200 bars/call). **Daily historical data comes from the auth-free pykrx** (broker-independent).
 
 ---
@@ -272,6 +272,8 @@ To load a `.env` file, explicitly pass `--env-file .env` to `uv run`.
 Use `uvx` for isolated standalone tools and `uv run` for this project's application and tests.
 
 ### Key setup
+
+See the [macOS setup guide (Korean)](./docs/MACOS_SETUP.md) for commands, credentials, allowed IP settings, and validation limits.
 
 Keys are entered and managed on the **Settings tab of the dashboard** (stored locally only).
 

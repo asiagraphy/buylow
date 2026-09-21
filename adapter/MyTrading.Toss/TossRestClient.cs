@@ -132,6 +132,8 @@ namespace MyTrading.Toss
         private DateTime _lastOrderAt = DateTime.MinValue;
         private static readonly TimeSpan OrderMinInterval = TimeSpan.FromMilliseconds(250); // ≤4건/초
         private const int OrderMaxAttempts = 4;
+        private readonly object _historyGate = new object();
+        private DateTime _lastHistoryAt = DateTime.MinValue;
 
         public TossRestClient(string clientId, string clientSecret, string tokenCachePath = null, HttpClient http = null)
         {
@@ -237,6 +239,15 @@ namespace MyTrading.Toss
         /// <summary>GET 후 BFF 봉투의 result(JToken)를 반환.</summary>
         private JToken GetResult(string path, IDictionary<string, string> query, bool account)
         {
+            if (path.StartsWith(TossConstants.PathOrders, StringComparison.Ordinal))
+            {
+                lock (_historyGate)
+                {
+                    var remaining = TimeSpan.FromMilliseconds(250) - (DateTime.UtcNow - _lastHistoryAt);
+                    if (remaining > TimeSpan.Zero) System.Threading.Thread.Sleep(remaining);
+                    _lastHistoryAt = DateTime.UtcNow;
+                }
+            }
             var sb = new StringBuilder(_baseUrl + path);
             if (query != null && query.Count > 0)
             {
@@ -398,8 +409,8 @@ namespace MyTrading.Toss
             return SendOrder(TossConstants.PathOrderCancel(orderId), "{}", false);
         }
 
-        /// <summary>주문 전송 공통 — 페이싱 + 429/일시오류 백오프 재시도. 실패해도 예외 없이 Ok=false 반환
-        /// (전송오류 1건이 라이브 전체를 RuntimeError로 종료시키지 않게 — KIS 어댑터와 동일 정책).</summary>
+        /// <summary>429 거부는 Retry-After를 반영한다. 전송 실패는 멱등성 키가 있는 생성 주문만 재시도한다.
+        /// 최종 접수 여부가 불명확하면 ORDER_STATE_UNKNOWN을 반환한다.</summary>
         private TossOrderResult SendOrder(string path, string body, bool idempotent)
         {
             lock (_orderGate)

@@ -21,12 +21,16 @@ namespace MyTrading.Toss.Tests
         public readonly Dictionary<string, (HttpStatusCode code, string json)> Routes
             = new Dictionary<string, (HttpStatusCode, string)>();
         public readonly List<string> Seen = new List<string>();
+        public readonly List<string> Bodies = new List<string>();
+        public Func<HttpRequestMessage, HttpResponseMessage> Respond;
 
         private HttpResponseMessage Build(HttpRequestMessage request)
         {
             var path = request.RequestUri.AbsolutePath;
             var key = request.Method.Method + " " + path;
             Seen.Add(key);
+            if (request.Content != null) Bodies.Add(request.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+            if (Respond != null && path.StartsWith("/api/v1/orders")) return Respond(request);
             (HttpStatusCode code, string json) hit;
             if (!Routes.TryGetValue(key, out hit) && !Routes.TryGetValue(path, out hit))
                 hit = (HttpStatusCode.NotFound, "{}");
@@ -66,6 +70,15 @@ namespace MyTrading.Toss.Tests
         public void IsTerminal_classifies_lifecycle(string status, bool terminal)
         {
             Assert.Equal(terminal, new TossOrderStatus { Status = status }.IsTerminal());
+        }
+
+        [Fact]
+        public void Partial_fill_price_uses_incremental_amount()
+        {
+            var previous = new TossOrderStatus { FilledQty = 2, FilledAmount = 200, AvgPrice = 100 };
+            var current = new TossOrderStatus { FilledQty = 5, FilledAmount = 560, AvgPrice = 112 };
+            Assert.Equal(120m, current.FillPriceSince(previous));
+            Assert.Equal(0m, current.FillPriceSince(current));
         }
     }
 
@@ -156,6 +169,81 @@ namespace MyTrading.Toss.Tests
             Assert.False(res.Ok);
             Assert.Equal("insufficient-cash", res.Code);   // 422는 즉시 반환(재시도 안 함)
             Assert.Contains("잔고", res.Message);
+        }
+
+        [Fact]
+        public void CreateOrder_retries_http_429_with_string_error_code()
+        {
+            var handler = new StubHandler();
+            handler.Routes["GET /api/v1/accounts"] = (HttpStatusCode.OK, Accounts);
+            var attempts = 0;
+            handler.Respond = request => new HttpResponseMessage(++attempts == 1
+                ? HttpStatusCode.TooManyRequests : HttpStatusCode.OK)
+            {
+                Content = new StringContent(attempts == 1
+                    ? "{\"error\":{\"code\":\"rate-limit-exceeded\"}}"
+                    : "{\"result\":{\"orderId\":\"created\"}}"),
+            };
+            var result = Client(handler).CreateOrder("005930", true, 1, 70000, false, "stable-key");
+            Assert.True(result.Ok);
+            Assert.Equal(2, attempts);
+            Assert.Equal(handler.Bodies[1], handler.Bodies[2]);
+        }
+
+        [Fact]
+        public void ModifyOrder_does_not_retry_ambiguous_transport_failure()
+        {
+            var handler = new StubHandler();
+            handler.Routes["GET /api/v1/accounts"] = (HttpStatusCode.OK, Accounts);
+            var attempts = 0;
+            handler.Respond = request => { attempts++; throw new HttpRequestException("response lost"); };
+            var result = Client(handler).ModifyOrder("original", 1, 70000, false);
+            Assert.False(result.Ok);
+            Assert.Equal("ORDER_STATE_UNKNOWN", result.Code);
+            Assert.Equal(1, attempts);
+        }
+
+        [Fact]
+        public void CreateOrder_reuses_idempotency_key_after_transport_failure()
+        {
+            var handler = new StubHandler();
+            handler.Routes["GET /api/v1/accounts"] = (HttpStatusCode.OK, Accounts);
+            var attempts = 0;
+            handler.Respond = request =>
+            {
+                if (++attempts == 1) throw new HttpRequestException("response lost");
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                { Content = new StringContent("{\"result\":{\"orderId\":\"same-order\"}}") };
+            };
+            var result = Client(handler).CreateOrder("005930", true, 1, 70000, false, "stable-key");
+            Assert.True(result.Ok);
+            Assert.Equal(2, attempts);
+            Assert.Equal(handler.Bodies[1], handler.Bodies[2]);
+        }
+
+        [Fact]
+        public void GetOpenOrders_preserves_partial_fill_baseline()
+        {
+            var handler = new StubHandler();
+            handler.Routes["GET /api/v1/accounts"] = (HttpStatusCode.OK, Accounts);
+            handler.Routes["GET /api/v1/orders"] = (HttpStatusCode.OK,
+                "{\"result\":{\"orders\":[{\"orderId\":\"pending\",\"symbol\":\"005930\"," +
+                "\"currency\":\"KRW\",\"side\":\"BUY\",\"orderType\":\"LIMIT\",\"status\":\"PARTIAL_FILLED\"," +
+                "\"quantity\":\"10\",\"price\":\"70000\",\"orderedAt\":\"2026-06-01T09:00:00+09:00\"," +
+                "\"execution\":{\"filledQuantity\":\"3\",\"filledAmount\":\"210000\",\"averageFilledPrice\":\"70000\"}}]}}");
+            var pending = Assert.Single(Client(handler).GetOpenOrders());
+            Assert.Equal(7m, pending.Quantity - pending.FilledQty);
+            Assert.Equal(210000m, pending.FilledAmount);
+            Assert.Equal("pending", pending.OrderId);
+        }
+
+        [Fact]
+        public void GetOpenOrders_does_not_treat_missing_response_as_empty_account()
+        {
+            var handler = new StubHandler();
+            handler.Routes["GET /api/v1/accounts"] = (HttpStatusCode.OK, Accounts);
+            handler.Routes["GET /api/v1/orders"] = (HttpStatusCode.OK, "{\"result\":{}}");
+            Assert.Throws<TossException>(() => Client(handler).GetOpenOrders());
         }
     }
 }

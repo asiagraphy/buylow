@@ -257,7 +257,7 @@ namespace MyTrading.Toss
                 else throw new TossException("지원하지 않는 미체결 주문 유형입니다.");
                 order.BrokerId.Add(pending.OrderId);
                 order.Status = OrderStatus.Submitted;
-                _trackedFilled[pending.OrderId] = pending;
+                _trackedFilled.TryAdd(pending.OrderId, pending);
                 orders.Add(order);
             }
             return orders;
@@ -308,8 +308,7 @@ namespace MyTrading.Toss
                 var filledStatus = st.Status != null && st.Status.ToUpperInvariant() == "FILLED";
                 foreach (var order in orders)
                 {
-                    // 새 체결분(증분)이 있으면 fill 이벤트. 수수료/세금은 토스가 누적으로 주므로
-                    // 전량 체결(FILLED) 시 1회만 반영(부분체결 구간은 0 — 중복 합산 방지).
+                    // 누적 체결금액·수량·수수료의 증분만 반영한다.
                     if (delta > 0)
                     {
                         var fee = new OrderFee(new CashAmount(
@@ -328,12 +327,14 @@ namespace MyTrading.Toss
                     //  - FILLED인데 새 증분이 없던 케이스(원자적 업데이트가 어긋난 드문 경우) → 0수량 Filled로 종결
                     if (st.IsTerminal())
                     {
+                        var finalFee = delta > 0 ? OrderFee.Zero : new OrderFee(new CashAmount(
+                            Math.Max(0, st.Commission + st.Tax - previous.Commission - previous.Tax),
+                            TossConstants.KrwCurrency));
                         if (!filledStatus && !(st.Status == "REPLACED" && _replacements.ContainsKey(orderId)))
-                            OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                            OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, finalFee,
                                 $"토스 주문 종료: {st.Status}") { Status = OrderStatus.Canceled });
-                        else if (delta <= 0)
-                            OnOrderEvent(new OrderEvent(order, DateTime.UtcNow,
-                                new OrderFee(new CashAmount(st.Commission + st.Tax, TossConstants.KrwCurrency)))
+                        else if (filledStatus && delta <= 0)
+                            OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, finalFee)
                             { Status = OrderStatus.Filled, FillPriceCurrency = TossConstants.KrwCurrency });
                     }
                 }

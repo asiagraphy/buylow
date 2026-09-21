@@ -263,10 +263,8 @@ namespace MyTrading.Kis
             return SendOrder(KisConstants.PathOrderCash, body.ToString(), trId);
         }
 
-        /// <summary>주문 전송(현금/정정취소 공통). 페이싱 + 레이트리밋/일시적 전송오류 백오프 재시도.
-        /// ★ 실패해도 예외를 던지지 않고 Ok=false 결과를 돌려준다 — 호출측(KisBrokerage)이 주문 1건만
-        /// Invalid 처리하고 알고리즘은 계속 살아있게 하기 위함(전송오류 1건이 라이브 전체를 RuntimeError로
-        /// 종료시키던 회귀 차단).</summary>
+        /// <summary>주문 전송. 명시적인 초당 한도 거부만 재시도한다.
+        /// 접수 여부를 알 수 없는 전송 실패는 ORDER_STATE_UNKNOWN으로 자동매매를 중지한다.</summary>
         private KisOrderResult SendOrder(string path, string body, string trId)
         {
             lock (_orderGate)

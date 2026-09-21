@@ -18,8 +18,9 @@ LEAN events.
 
 ## How Toss differs from KIS (the important part)
 
-Toss Securities Open API has **no realtime WebSocket** for fills or quotes. So the adapter is
-**polling-based** where KIS is push-based:
+Toss Securities Open API supports REST and WebSocket streams. This adapter currently uses
+REST polling for quotes and fills; KIS uses WebSocket notifications.
+The [official API reference](https://developers.tossinvest.com/docs) documents both transports.
 
 | Concern | KIS | Toss |
 |---|---|---|
@@ -28,7 +29,7 @@ Toss Securities Open API has **no realtime WebSocket** for fills or quotes. So t
 | Demo/모의 | separate keys + server | **none** — real only |
 | Fills | WebSocket 체결통보 (`H0STCNI0`) | **poll `getOrder(orderId)`** until terminal → `OnOrderEvent` |
 | Realtime quotes | WebSocket `H0STCNT0` | **poll `getPrices(symbols)`** (≤200/call) → feed |
-| HTS ID | required (체결통보 구독) | **not needed** (no fill WebSocket) |
+| HTS ID | required (체결통보 구독) | **not needed** (OAuth2 account identification) |
 
 Because fills come from polling, **no HTS ID gate** applies to Toss — `live_start_ok` only requires
 `enabled` + `client_id`/`client_secret`.
@@ -144,14 +145,25 @@ uv run --locked pytest tests/test_toss.py
 
 - **체결/시세가 폴링 기반**이라 KIS의 WebSocket보다 지연이 있다(체결 ~1.5s, 시세 ~2s 주기). 분봉
   타이밍에는 충분하나 초 단위 정밀 체결에는 KIS가 유리하다.
-- **GetOpenOrders**는 빈 목록(새 세션은 미체결 동기화 안 함) — 재시작 시 기존 미체결 복구는 미구현.
-  보유 포지션은 `getHoldings`로 실측되어 RuleAlpha가 델타만 거래하므로 중복 매수는 없다.
-- **수수료**는 전량 체결(FILLED) 시 `getOrder`의 commission+tax를 1회 반영(부분체결 구간은 0). 부분
-  체결의 평균단가는 누적 평균을 쓰는 근사.
-- **종료(CLOSED) 주문 목록 조회 미지원**(Toss API `getOrders`는 OPEN만) → 매매 탭의 '매매 내역'은
-  토스에선 buylow 자체 거래로그(TradeStore)로 폴백한다(KIS는 체결조회로 실거래 표시).
-- **주문 안정성(구현됨)**: `TossRestClient.SendOrder`가 주문을 **최소간격 페이싱(250ms·≤4건/초) +
-  429/일시적 전송오류 백오프 재시도(최대 4회)**로 감싸고, 실패해도 예외 없이 `Ok=false`만 반환한다
-  (주문 1건 실패가 라이브 전체를 종료시키지 않게 — `TossBrokerage`의 catch는 모두 Warning).
+- **Open orders**: startup reads `status=OPEN`, restores the remaining domestic quantity,
+  and retains the cumulative fill baseline. An unreadable response fails startup.
+- **Partial fills**: incremental price uses the change in cumulative filled amount divided
+  by the new filled quantity. Commission and tax increments are applied once.
+- **Order history**: the dashboard reads OPEN and CLOSED orders. CLOSED pagination is followed
+  to completion. Rows aggregate fills per order; the date filter is the order creation date.
+- **Retries**: HTTP 429 honors `Retry-After`. Order creation uses a session-independent random
+  `clientOrderId`, preserved across retries. Modification and cancellation are not retried
+  after ambiguous transport failures. Unknown final order state disables automatic trading
+  and stops the process; check broker order history before restarting.
+- **Modification and cancellation**: replacement IDs are tracked; cancellation acknowledgment
+  is pending until the original order's final state is observed.
+- **Minute candles**: Toss timestamps mark the end of a minute. Ingestion subtracts one minute
+  for LEAN and includes the 15:31 candle containing the closing auction. Data is KRX+NXT
+  integrated data, not an exchange-specific KRX feed. Previously ingested minute files are
+  not rewritten by this change.
 - **프로세스 감독/재개**는 KIS와 공통(`LiveProcessManager` — 백오프 재시작, 부팅 시 재개, 종료 시 kill).
 - ⛔ 토스는 실전 단일이라 **실계좌 검증 전까지 토글을 켜지 말 것**(켜면 바로 실주문이 나간다).
+
+These behaviors are covered by offline regression tests. Authenticated fill, cancellation,
+replacement, and reconnect behavior still require account-level validation. The published
+OpenAPI specification lists a production server only; this adapter has no paper execution mode.

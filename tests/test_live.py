@@ -167,3 +167,39 @@ def test_build_live_config_injects_kis_brokerage_data(tmp_path):
     assert cfg["kis-max-order-amount"] == "300000"
     assert cfg["kis-hts-id"] == "H"
     assert cfg["kis-token-cache"] == "/tmp/.kis_token.json"
+
+
+def test_unknown_order_stops_process_and_persists_disabled(tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from orchestrator.lean import runner
+
+    config.set_broker("toss")
+    config.set_live_enabled(True)
+    config.save_secrets({"toss_client_id": "test-client", "toss_client_secret": "test-secret"})
+    (tmp_path / "MyTrading.Toss.dll").touch()
+
+    class Process:
+        stdout = ["ORDER_STATE_UNKNOWN: response lost\n"]
+        returncode = 0
+        terminated = False
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self):
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(runner, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: process)
+    environment = SimpleNamespace(
+        launcher_dll=tmp_path / "BuylowLauncher.dll", dotnet_exe=Path("dotnet"),
+        venv_site_packages=tmp_path, algorithm_imports_dir=tmp_path,
+        process_env=lambda parts: {},
+    )
+    result = runner.LeanRunner(environment).run_live(_req(tmp_path))
+    assert process.terminated
+    assert result.stop_reason
+    assert config.get_live_config()["enabled"] is False
