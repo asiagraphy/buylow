@@ -85,11 +85,11 @@ def test_realistic_order_lifecycle_does_not_assume_submission_is_a_fill(tmp_path
     assert engine.state["positions"]["AAPL"]["quantity"] == quantity
     assert not engine.state["pending"]
     assert engine.summary()["estimated_profit_usd"] < 0
-    broker.price = 103
+    broker.price = 105
     broker.now += timedelta(seconds=5)
     engine.tick()
     assert broker.placed[-1][1] == "SELL"
-    broker.fill("2", quantity, 102.9)
+    broker.fill("2", quantity, 104.9)
     broker.now += timedelta(seconds=5)
     engine.tick()
     assert not engine.state["positions"]

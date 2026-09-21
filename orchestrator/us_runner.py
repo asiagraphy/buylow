@@ -115,7 +115,6 @@ class UsRunner:
                 "entry_price": average, "opened_at": previous["opened_at"] if previous else self.now().isoformat(),
                 "stop_price": average - pending["stop_distance"],
                 "target_price": average + pending["target_distance"],
-                "peak_price": max(average, previous["peak_price"] if previous else average),
             }
             self.state["cash_flow"] -= increment + fee
         else:
@@ -217,7 +216,7 @@ class UsRunner:
     def _position(self, symbol: str, value: dict) -> Position:
         return Position(Stock(symbol, value["exchange"]), value["quantity"], value["entry_price"],
                         datetime.fromisoformat(value["opened_at"]), value["stop_price"],
-                        value["target_price"], value["peak_price"])
+                        value["target_price"])
 
     def tick(self) -> dict:
         if not self.started:
@@ -266,7 +265,6 @@ class UsRunner:
         for symbol, value in list(self.state["positions"].items()):
             position = self._position(symbol, value)
             reason = self.state["halt"] or exit_reason(self.strategy, position, quotes[symbol].bid, now, session.close)
-            value["peak_price"] = position.peak_price
             if reason:
                 if symbol in self.state["pending"]:
                     pending = self.state["pending"][symbol]

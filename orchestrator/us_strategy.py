@@ -107,7 +107,6 @@ class Position:
     opened_at: datetime
     stop_price: float
     target_price: float
-    peak_price: float
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -177,10 +176,9 @@ def entry_signal(strategy: Strategy, stock: Stock, bars: list[Bar], now: datetim
     stop_distance = max(1.25 * atr, current.close * 0.006)
     if stop_distance > current.close * 0.02:
         return None
-    target_distance = strategy.reward_multiple * stop_distance
     round_trip_cost = current.close * 2 * (strategy.commission_bps + strategy.slippage_bps) / 10_000
-    if target_distance < round_trip_cost * 1.5:
-        return None
+    # 가격 차이만 2배로 잡으면 수수료가 큰 계좌에서 순손익비가 역전된다.
+    target_distance = strategy.reward_multiple * (stop_distance + round_trip_cost) + round_trip_cost
     score = min(relative_volume, 5) * (current.close / bars[0].open - 1) / (stop_distance / current.close)
     return Entry(stock, current.end, current.close, stop_distance, target_distance,
                  relative_volume, score, reason)
@@ -193,7 +191,7 @@ def size_entry(strategy: Strategy, entry: Entry, budget: float, available_cash: 
         return 0
     fee_factor = 1 + strategy.commission_bps / 10_000
     # 매매 비용도 손실 예산에 포함해 작은 손절폭이 과도한 수량으로 이어지지 않게 한다.
-    risk_per_share = entry.stop_distance + 2 * limit_price * strategy.commission_bps / 10_000
+    risk_per_share = entry.stop_distance + 2 * limit_price * (strategy.commission_bps + strategy.slippage_bps) / 10_000
     return max(0, math.floor(min(
         budget * strategy.risk_fraction / risk_per_share,
         budget * strategy.position_fraction / (limit_price * fee_factor),
@@ -205,7 +203,6 @@ def exit_reason(strategy: Strategy, position: Position, price: float, now: datet
                 session_close: datetime) -> str | None:
     if not math.isfinite(price) or price <= 0:
         raise ValueError("유효한 현재가가 필요합니다")
-    position.peak_price = max(position.peak_price, price)
     if now >= session_close - timedelta(minutes=10):
         return "장 마감 전 청산"
     if price <= position.stop_price:

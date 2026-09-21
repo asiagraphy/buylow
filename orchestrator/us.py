@@ -169,6 +169,12 @@ def report_saved(mode: str, name: str, trial: str = "week"):
     report["positions"] = saved["positions"]
     report["pending_orders"] = saved["pending"]
     report["fills"] = saved["fills"]
+    profit = saved["cash_flow"] + sum(position["quantity"] * saved["marks"].get(symbol, position["entry_price"])
+                                       for symbol, position in saved["positions"].items())
+    report["estimated_profit_usd"] = round(profit, 2)
+    report["estimated_return_pct"] = round(profit / saved["budget"] * 100, 3)
+    report["max_drawdown_pct"] = round(saved["max_drawdown"] * 100, 3)
+    report["valuation"] = "저장된 마지막 시세와 설정한 수수료 기준 추정치"
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

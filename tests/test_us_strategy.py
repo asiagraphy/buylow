@@ -84,7 +84,7 @@ def test_size_respects_risk_cash_allocation_and_whole_shares():
 
 def test_exits_respect_early_close_and_holding_deadline():
     opening, closing = session()
-    position = Position(Stock("AAPL"), 5, 100, opening, 99, 102, 100)
+    position = Position(Stock("AAPL"), 5, 100, opening, 99, 102)
     strategy = STRATEGIES["momentum"]
     assert exit_reason(strategy, position, 98.9, opening + timedelta(minutes=1), closing) == "손절"
     assert exit_reason(strategy, position, 102, opening + timedelta(minutes=2), closing) == "목표수익 도달"
@@ -98,3 +98,12 @@ def test_daily_and_trial_loss_stop_new_risk():
     assert loss_limit(strategy, 10000, -100, -200) == "일일 손실 한도"
     assert loss_limit(strategy, 10000, -500, 0) == "실험 전체 손실 한도"
     assert loss_limit(strategy, 10000, 0, 0) is None
+
+
+def test_profit_target_accounts_for_round_trip_costs():
+    opening, closing = session()
+    bars = breakout_bars()
+    strategy = STRATEGIES["momentum"]
+    result = entry_signal(strategy, Stock("NVDA"), bars, bars[-1].end, opening, closing)
+    cost = result.reference_price * 2 * (strategy.commission_bps + strategy.slippage_bps) / 10000
+    assert result.target_distance - cost == pytest.approx(strategy.reward_multiple * (result.stop_distance + cost))

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from orchestrator import us
 from orchestrator.us_strategy import Stock
 
@@ -63,3 +61,32 @@ def test_trial_name_does_not_allow_path_escape(monkeypatch, tmp_path):
     assert us.state_path("demo", "momentum", "week2").name == "momentum-week2.json"
     with pytest.raises(ValueError):
         us.state_path("demo", "momentum", "../../account")
+
+
+def test_replay_command_runs_from_terminal_and_writes_a_complete_report(tmp_path):
+    import csv
+    import json
+    import subprocess
+    import sys
+    from datetime import datetime, timedelta
+    from orchestrator.us_strategy import NEW_YORK
+
+    source = tmp_path / "minutes.csv"
+    output = tmp_path / "result.json"
+    opening = datetime(2026, 9, 21, 9, 30, tzinfo=NEW_YORK)
+    with source.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("symbol", "exchange", "time", "open", "high", "low", "close", "volume"))
+        for minute in range(1, 71):
+            price = 100 + minute * 0.02 if minute < 25 else 101 + (minute - 25) * 0.1
+            writer.writerow(("AAPL", "NASD", (opening + timedelta(minutes=minute)).isoformat(),
+                             price - 0.03, price + 0.05, price - 0.06, price,
+                             20000 if minute == 25 else 10000))
+    result = subprocess.run([sys.executable, "-m", "orchestrator.us", "replay", "--file", str(source),
+                             "--strategy", "momentum", "--output", str(output)],
+                            cwd=us.ROOT, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text())
+    assert report["mode"] == "replay" and report["fills"] >= 2
+    assert report["finished_flat"]
+    assert len(report["equity_curve"]) == 70
