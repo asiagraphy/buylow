@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from datetime import date, datetime, timedelta
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 
@@ -21,6 +22,21 @@ HOSTS = {"demo": "https://openapivts.koreainvestment.com:29443",
          "real": "https://openapi.koreainvestment.com:9443"}
 ORDER_IDS = {"demo": {"BUY": "VTTT1002U", "SELL": "VTTT1001U"},
              "real": {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}}
+
+
+@dataclass(frozen=True)
+class Quote:
+    time: datetime
+    last: float
+    bid: float
+    ask: float
+
+    def fresh(self, now: datetime, maximum_age: float = 120) -> bool:
+        return 0 <= (now - self.time).total_seconds() <= maximum_age
+
+    @property
+    def spread(self) -> float:
+        return (self.ask - self.bid) / ((self.ask + self.bid) / 2)
 
 
 class BrokerError(RuntimeError):
@@ -59,6 +75,7 @@ def private_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.flush()
@@ -200,6 +217,20 @@ class KisUsClient:
         if not math.isfinite(price) or price <= 0:
             raise BrokerError("유효한 미국 주식 현재가가 없습니다")
         return price
+
+    def book(self, stock: Stock) -> Quote:
+        payload, _ = self.request("GET", "/uapi/overseas-price/v1/quotations/inquire-asking-price", "HHDFS76200100",
+                                  {"AUTH": "", "EXCD": stock.quote_exchange, "SYMB": stock.symbol})
+        market, book = payload["output1"], payload["output2"]
+        if isinstance(market, list):
+            market = market[0]
+        if isinstance(book, list):
+            book = book[0]
+        timestamp = datetime.strptime(book["dymd"] + book["dhms"].zfill(6), "%Y%m%d%H%M%S").replace(tzinfo=NEW_YORK)
+        quote = Quote(timestamp, float(market["last"]), float(book["pbid1"]), float(book["pask1"]))
+        if not all(math.isfinite(value) and value > 0 for value in (quote.last, quote.bid, quote.ask)) or quote.ask < quote.bid:
+            raise BrokerError("미국 주식 호가를 확인할 수 없습니다")
+        return quote
 
     def buying_power(self, stock: Stock, price: float) -> float:
         transaction = "VTTS3007R" if self.mode == "demo" else "TTTS3007R"
