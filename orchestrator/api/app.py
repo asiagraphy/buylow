@@ -62,7 +62,7 @@ def _default_get_broker():
 
 def create_app(runner: LeanRunner | None = None, store: RunStore | None = None,
                jobs: JobManager | None = None, trade_store: TradeStore | None = None,
-               get_broker=None, broker_cache=None, live_manager=None) -> FastAPI:
+               get_broker=None, broker_cache=None, live_manager=None, us_dashboard=None) -> FastAPI:
     # 활성 증권사 기준 잔고·당일 체결을 백그라운드로 주기 갱신해 메모리 캐시(매매 탭 즉시 표시).
     _get_broker = get_broker or _default_get_broker
     if broker_cache is None:
@@ -81,9 +81,12 @@ def create_app(runner: LeanRunner | None = None, store: RunStore | None = None,
             # 종료 시 라이브 프로세스를 kill — 고아 프로세스로 매매가 계속되는 것을 막는다.
             # config(enabled)는 유지되므로 다음 부팅 때 _resume_live_if_enabled가 재개한다.
             try:
-                live_manager.shutdown()
+                us_dashboard.shutdown()
             finally:
-                broker_cache.stop()
+                try:
+                    live_manager.shutdown()
+                finally:
+                    broker_cache.stop()
 
     def _resume_live_if_enabled() -> None:
         """부팅 시점 재개: config.live가 켜졌고 시작 가드(enabled+HTS ID)·전략·유니버스·어댑터가
@@ -104,6 +107,10 @@ def create_app(runner: LeanRunner | None = None, store: RunStore | None = None,
             pass  # 부팅 재개 실패가 서버 기동을 막지 않게 한다(감독 스레드가 이후 재시도)
 
     app = FastAPI(title="buylow", version="0.0.1", lifespan=_lifespan)
+    if us_dashboard is None:
+        from ..us_dashboard import UsDashboard
+        us_dashboard = UsDashboard()
+    app.state.us_dashboard = us_dashboard
     # runner는 lazy: 주입되지 않았으면 첫 실행 때 생성(런처 빌드 비용을 startup에서 회피)
     state: dict[str, Any] = {"runner": runner, "store": store or RunStore(),
                              "jobs": jobs or JobManager(),

@@ -107,10 +107,11 @@ def test_daily_backtest_not_limited(client):
     assert r.status_code == 303 and "/jobs/" in r.headers["location"]
 
 
-def test_root_redirects_to_strategy(client):
+def test_root_redirects_to_us_trading(client):
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 307
-    assert r.headers["location"] == "/strategy"
+    assert r.headers["location"] == "/us"
+    assert "미국주식 자동매매" in client.get("/").text
 
 
 def test_backtest_page_renders(client):

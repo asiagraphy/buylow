@@ -160,3 +160,32 @@ def test_trial_loss_stays_latched_after_price_recovery():
     engine.tick()
     assert engine.state["halt"] == "실험 전체 손실 한도"
     assert not broker.placed
+
+
+def test_auto_discovery_adds_non_seed_stock_and_keeps_exits_after_removal(tmp_path):
+    from test_us_universe import price_row, volume_row
+    broker = Broker()
+    broker.rankings = lambda kind, exchange: (
+        [{**price_row("FRESH"), "last": "101", "pbid": "100.99", "pask": "101.01"}]
+        if kind == "price" else [volume_row("FRESH")]) if exchange == "NASD" else []
+    path = tmp_path / "auto.json"
+    engine = UsRunner(broker, STRATEGIES["momentum"], (), 10000, path,
+                      now=lambda: broker.now, universe_mode="auto")
+    for _ in range(6):
+        engine.tick()
+        broker.now += timedelta(seconds=5)
+    assert broker.placed[0][0] == "FRESH"
+    quantity = broker.placed[0][2]
+    broker.fill("1", quantity, 101.1)
+    engine.tick()
+    engine.state["universe"]["candidates"] = []
+    engine.state["universe"]["error"] = "순위 조회 실패"
+    broker.price = 105
+    broker.now += timedelta(seconds=5)
+    engine.tick()
+    assert broker.placed[-1][0:3] == ("FRESH", "SELL", quantity)
+    engine.save()
+    resumed = UsRunner(broker, STRATEGIES["momentum"], (), 10000, path,
+                       now=lambda: broker.now, universe_mode="auto")
+    assert "FRESH" in resumed.state["positions"] and "FRESH" in resumed.state["pending"]
+    assert not resumed.scanner.verified

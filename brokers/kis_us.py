@@ -13,10 +13,11 @@ from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 
-from orchestrator.us_strategy import Bar, NEW_YORK, Stock
+from orchestrator.us_strategy import Bar, NEW_YORK, Stock, US_EXCHANGES
 
 HOSTS = {"demo": "https://openapivts.koreainvestment.com:29443",
          "real": "https://openapi.koreainvestment.com:9443"}
@@ -45,6 +46,14 @@ class BrokerError(RuntimeError):
 
 class OrderUncertain(BrokerError):
     """증권사 접수 여부를 확인할 수 없어 재전송하면 안 되는 주문."""
+
+
+class QueryUnavailable(BrokerError):
+    """주문 재전송과 구분되는 일시적인 조회·인증 통신 실패."""
+
+    def __init__(self, endpoint: str, reason: str, retry_after: int = 0):
+        self.endpoint, self.retry_after = endpoint, retry_after
+        super().__init__(f"KIS 조회 일시 실패: {endpoint} ({reason})")
 
 
 class RequestPacer:
@@ -123,8 +132,10 @@ class KisUsClient:
             })
             payload = response.json()
         except (requests.RequestException, ValueError) as error:
-            raise BrokerError("KIS 토큰 발급 응답을 확인할 수 없습니다") from error
+            raise QueryUnavailable("/oauth2/tokenP", type(error).__name__, retry_after=65) from error
         if response.status_code != 200 or not payload.get("access_token"):
+            if response.status_code == 429 or response.status_code >= 500:
+                raise QueryUnavailable("/oauth2/tokenP", f"HTTP {response.status_code}", retry_after=65)
             raise BrokerError(f"KIS 인증 실패 (HTTP {response.status_code}). 투자 환경과 키를 확인하세요")
         self.token = payload["access_token"]
         self.expires = time.time() + float(payload.get("expires_in", 86400)) - 600
@@ -146,7 +157,7 @@ class KisUsClient:
             except (requests.RequestException, ValueError) as error:
                 if method == "POST":
                     raise OrderUncertain("주문 응답이 불명확합니다. 주문내역 확인 전 재전송하지 마세요") from error
-                raise BrokerError("KIS 조회 응답을 확인할 수 없습니다") from error
+                raise QueryUnavailable(path, type(error).__name__) from error
             if response.status_code == 200 and str(payload.get("rt_cd")) == "0":
                 return payload, response.headers.get("tr_cont", "")
             code = str(payload.get("msg_cd", "UNKNOWN"))
@@ -155,6 +166,9 @@ class KisUsClient:
                 continue
             if method == "POST" and (response.status_code >= 500 or "rt_cd" not in payload):
                 raise OrderUncertain("주문 처리 결과가 불명확합니다. 증권사 주문내역을 확인하세요")
+            if method == "GET" and (response.status_code == 429 or response.status_code >= 500
+                                    or code == "EGW00201"):
+                raise QueryUnavailable(path, f"HTTP {response.status_code} / {code}")
             raise BrokerError(f"KIS 요청 거부: {code} (HTTP {response.status_code})")
         raise BrokerError("KIS 호출 한도를 초과했습니다")
 
@@ -227,7 +241,9 @@ class KisUsClient:
             if isinstance(block, list):
                 block = block[0] if block else {}
             fields.update(block)
-        timestamp = datetime.strptime(fields["dymd"] + fields["dhms"].zfill(6), "%Y%m%d%H%M%S").replace(tzinfo=NEW_YORK)
+        # 1호가의 dymd/dhms는 한국 시각이다. 분봉의 현지 시각(xymd/xhms)과 구분한다.
+        timestamp = datetime.strptime(fields["dymd"] + fields["dhms"].zfill(6), "%Y%m%d%H%M%S")
+        timestamp = timestamp.replace(tzinfo=ZoneInfo("Asia/Seoul")).astimezone(NEW_YORK)
         quote = Quote(timestamp, float(fields["last"]), float(fields["pbid1"]), float(fields["pask1"]))
         if not all(math.isfinite(value) and value > 0 for value in (quote.last, quote.bid, quote.ask)) or quote.ask < quote.bid:
             raise BrokerError("미국 주식 호가를 확인할 수 없습니다")
@@ -240,6 +256,21 @@ class KisUsClient:
              "OVRS_ORD_UNPR": limit_price(price, "BUY"), "ITEM_CD": stock.symbol})
         # 자동환전 가능액을 투자 현금으로 취급하지 않는다.
         return max(0.0, float(payload["output"]["ord_psbl_frcr_amt"]))
+
+    def rankings(self, kind: str, exchange: str) -> list[dict]:
+        endpoint, transaction = {"price": ("price-fluct", "HHDFS76260000"),
+                                 "volume": ("volume-surge", "HHDFS76270000")}[kind]
+        parameters = {"EXCD": US_EXCHANGES[exchange], "MINX": "5",
+                      "VOL_RANG": "4", "KEYB": "", "AUTH": ""}
+        if kind == "price":
+            parameters["GUBN"] = "1"
+        payload, _ = self.request("GET", f"/uapi/overseas-stock/v1/ranking/{endpoint}",
+                                  transaction, parameters)
+        rows = payload.get("output2")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise BrokerError("미국주식 순위 응답 형식이 올바르지 않습니다")
+        # 매매 감시를 지연시키지 않도록 각 거래소의 첫 페이지를 후보 소스로 사용한다.
+        return rows
 
     def holdings(self, exchanges: set[str]) -> list[dict]:
         transaction = "VTTS3012R" if self.mode == "demo" else "TTTS3012R"

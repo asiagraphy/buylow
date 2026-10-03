@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from brokers.kis_us import BrokerError, KisUsClient, OrderUncertain, private_json
+from brokers.kis_us import BrokerError, KisUsClient, OrderUncertain, QueryUnavailable, private_json
 from market.us import session_for
 from . import config
 from .us_replay import load_bars, replay
@@ -169,6 +169,8 @@ def report_saved(mode: str, name: str, trial: str = "week"):
     report["positions"] = saved["positions"]
     report["pending_orders"] = saved["pending"]
     report["fills"] = saved["fills"]
+    report["universe_mode"] = saved.get("universe_mode", "manual")
+    report["universe"] = saved.get("universe")
     profit = saved["cash_flow"] + sum(position["quantity"] * saved["marks"].get(symbol, position["entry_price"])
                                        for symbol, position in saved["positions"].items())
     report["estimated_profit_usd"] = round(profit, 2)
@@ -180,20 +182,48 @@ def report_saved(mode: str, name: str, trial: str = "week"):
 
 def run_live(arguments):
     strategy = strategy_for(arguments)
-    stocks = stocks_from_text(arguments.stocks)
+    stocks = stocks_from_text(arguments.stocks) if arguments.universe_mode == "manual" else ()
     with account_lock(arguments.mode):
         broker = client_for(arguments.mode)
         def event(value):
             print(json.dumps(value, ensure_ascii=False), flush=True)
         runner = UsRunner(broker, strategy, stocks, arguments.budget,
-                          state_path(arguments.mode, strategy.name, arguments.trial), on_event=event)
+                          state_path(arguments.mode, strategy.name, arguments.trial), on_event=event,
+                          universe_mode=arguments.universe_mode)
         print(f"{strategy.label} / {'모의투자' if arguments.mode == 'demo' else '실전투자'} / 예산 ${arguments.budget:,.2f}")
         print("중지: Control+C. 중지해도 보유 주식과 증권사 미체결 주문은 남습니다.")
         last_display = None
+        failures = 0
         try:
             while True:
                 before = time.monotonic()
-                result = runner.tick()
+                try:
+                    result = runner.tick()
+                except QueryUnavailable as error:
+                    failures += 1
+                    # 실패한 분봉 확인을 완료한 것으로 남기지 않고 다음 사이클에서 다시 확인한다.
+                    runner.last_scan = None
+                    runner.scan_times.clear()
+                    delay = max(error.retry_after, min(60, 5 * 2 ** min(failures - 1, 4)))
+                    health = dict(status="retrying", error=str(error), endpoint=error.endpoint,
+                                  time=runner.now().isoformat(), attempts=failures,
+                                  next_retry=(runner.now() + timedelta(seconds=delay)).isoformat())
+                    runner.state["query_health"] = health
+                    runner.save()
+                    # 계좌·키·응답 원문 없이 실패 위치와 복구 시도를 남긴다.
+                    descriptor = os.open(runner.path.with_suffix(".errors.jsonl"),
+                                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                        stream.write(json.dumps(health, ensure_ascii=False) + "\n")
+                    print(json.dumps({**runner.summary(), "phase": "retrying",
+                                      "error": str(error), "retry_seconds": delay}, ensure_ascii=False), flush=True)
+                    time.sleep(delay)
+                    continue
+                if failures or runner.state.get("query_health", {}).get("status") == "retrying":
+                    runner.state["query_health"] = {**runner.state.get("query_health", {}),
+                                                    "status": "recovered", "recovered_at": runner.now().isoformat()}
+                    runner.save()
+                    failures = 0
                 display = (datetime.now(NEW_YORK).strftime("%Y-%m-%d %H:%M"), result["phase"],
                            result["fills"], result["halt"])
                 if display != last_display:
@@ -203,6 +233,9 @@ def run_live(arguments):
                     print("실험을 종료했습니다. status 명령으로 결과를 확인하세요.")
                     break
                 time.sleep(max(0, (15 if result["phase"] == "closed" else 5) - (time.monotonic() - before)))
+        except BrokerError as error:
+            runner.state["query_health"] = dict(status="stopped", error=str(error), time=runner.now().isoformat())
+            raise
         finally:
             runner.save()
             result = runner.summary()
@@ -253,6 +286,8 @@ def main(argv=None) -> int:
         if name == "doctor":
             command.add_argument("--online", action="store_true", help="토큰 발급과 계좌 조회, 주문 없음")
         if name == "run":
+            command.add_argument("--universe-mode", choices=("manual", "auto"), default="manual",
+                                 help="auto: 순위 기반 후보 자동 갱신, manual: 지정 종목만 감시")
             command.add_argument("--budget", type=float, required=True, help="이 전략에 사용할 USD 예산")
             command.add_argument("--commission-bps", type=float)
             command.add_argument("--stocks", help="기본 후보군 대신 AAPL,NASD:NVDA,NYSE:IBM 형식")

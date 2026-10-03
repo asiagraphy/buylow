@@ -62,6 +62,13 @@ Every Claude session working in this repo follows these:
 
 ## 3. Current status
 
+US equities have a separate `/us` dashboard backed by `orchestrator/us.py` and
+`UsRunner`, not LEAN. The root page opens this dashboard. Automatic universe discovery
+uses `orchestrator/us_universe.py`: bounded KIS rankings, liquidity/spread filters,
+cross-sectional scores, five-minute refresh, and independent position/order ownership.
+Manual mode remains available. CSV replay does not validate live universe selection.
+See [US_TRADING_REVIEW.md](./docs/US_TRADING_REVIEW.md) for execution and validation scope.
+
 **Backtest pipeline and KIS/Toss adapters are implemented.** Account-order validation and trading recovery issues remain open. See [UV_MIGRATION.md](./docs/UV_MIGRATION.md) for the reviewed runtime changes and their verification boundary.
 
 - LEAN integration (NuGet + thin launcher, C#/Python e2e); KRX-correct stats (Asia/Seoul TZ + constant risk-free rate)

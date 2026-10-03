@@ -6,7 +6,7 @@
 
 **A personal automated-trading toolkit with a Korean-equity dashboard and short-horizon US-equity strategies. Start with KIS paper trading and keep real-account settings separate.**
 
-Korean equities use a [QuantConnect LEAN](https://github.com/QuantConnect/Lean) web dashboard. US equities use a Python terminal runner sharing strategy and order-state logic across CSV replay, KIS paper trading, and real trading. Sharing logic does not guarantee identical fills.
+Korean equities use [QuantConnect LEAN](https://github.com/QuantConnect/Lean), and US equities use a Python runner. Both can be started from the web dashboard. US strategy and order-state logic is shared across CSV replay, KIS paper trading, and real trading, without guaranteeing identical fills.
 
 [한국어](./README.md) · **English** · [日本語](./README.ja.md)
 
@@ -46,11 +46,11 @@ Korean equities use a [QuantConnect LEAN](https://github.com/QuantConnect/Lean) 
 
 | Workflow | Interface | Requirements |
 |---|---|---|
-| US-equity paper/real trading | Terminal commands below | uv, Python 3.11, KIS credentials and account for the selected environment |
+| US-equity paper/real trading | US-equity web tab or terminal | uv, Python 3.11, KIS credentials and account for the selected environment |
 | US CSV backtest | `replay` | uv, Python 3.11, historical minute CSV; no API credentials |
 | Korean-equity strategy/backtest/trading | Web dashboard | uv and .NET/LEAN, or Docker; data and broker configuration |
 
-For US equities, **no .NET, Docker, KRX login, or Toss credentials are required**. US strategies are not yet selectable or monitored in the dashboard. The overseas implementation covers US NASDAQ, NYSE, and AMEX, not other countries.
+For US equities, **no .NET, Docker, KRX login, or Toss credentials are required**. The default US-equity web page supports selection, start/stop, and monitoring. Overseas coverage is US NASDAQ, NYSE, and AMEX, not other countries.
 
 Settings and history are stored locally. Authentication, quote, and order requests send the required information to the selected broker. Do not share `.env.local`, tokens, or account-state files.
 
@@ -59,6 +59,21 @@ US strategy and paper/real execution code is implemented with offline tests. **A
 ---
 
 ## Getting started with US equities
+
+### Open the web dashboard after saving credentials
+
+```bash
+uv run --locked --env-file .env.local python -m orchestrator.api
+```
+
+Open **http://127.0.0.1:8420/us**. The root address also opens US equities. If a server was running before the update, stop it with Control+C and restart with this command.
+
+1. Select paper trading, then momentum (60-minute holding limit) or opening-range (90 minutes). The Korean strategy's three-day holding setting does not apply.
+2. Choose automatic discovery or manual candidates, then USD budget, trial name, and commission. Automatic mode ignores the manual symbol field. Saving settings does not submit orders.
+3. Start trading. Status, positions, pending orders, recent fills, and estimated results refresh every five seconds.
+4. Use the US stop button to stop the runner, then separately check broker orders and holdings. Stopping is not cancellation or liquidation.
+
+Real trading requires explicit real-order consent. Closing the browser leaves the runner active; stopping the server stops it. US trading does not automatically resume on server restart. A separately started CLI runner must be stopped in its own Terminal. Do not run web and CLI trading concurrently in the same mode. Follow the steps below for first-time installation or CLI operation.
 
 ### 1. Open the project in Terminal
 
@@ -192,6 +207,45 @@ Use a new name such as `--trial week2` for a new experiment, after checking and 
 
 ## US strategies and operating rules
 
+### Automatic candidate discovery
+
+Select automatic discovery in the web page to refresh candidates from the first pages of
+KIS price-fluctuation and volume-surge rankings for NASDAQ, NYSE, and AMEX. This is a
+bounded ranking source, not exhaustive coverage of all US stocks. Use a new trial name
+when switching from manual mode, after checking existing holdings and orders.
+
+Refresh attempts begin 22 minutes after the regular open, every five minutes, selecting
+at most 12 symbols. A symbol must appear in both rankings, trade at least USD 5, be up
+at least 3% for the day and positive over 15 minutes, have at least 100,000 cumulative
+shares and USD 5 million estimated turnover, at least USD 250,000 average minute turnover
+over the last 15 minutes, and spread no wider than 0.2%. Turnover is approximated from
+price and volume. Name-based ETF, ETN, 2X, 3X, warrant, and rights exclusions are not a
+replacement for security-master classification.
+
+Eligible stocks receive cross-sectional percentile scores: 40% daily return, 35% 15-minute
+return, and 25% recent turnover, minus a spread penalty. Incumbents receive three retention
+points to reduce churn. Selection alone never submits an order: completed-bar trend and
+relative-volume entry rules still apply. These are initial policy weights, not optimized
+or validated return claims.
+
+Positions and pending orders remain managed when candidates leave the ranking. Discovery
+failure or snapshots older than ten minutes block new entries without stopping position
+management. Restart requires a fresh ranking. Ranking requests are spread over runner
+cycles after fill/exit processing, and minute-bar checks rotate through symbols. Slow API
+responses can make a full scan take more than one minute. The web page shows factors,
+scores, timestamps, and errors; snapshots are saved beside state as `*.universe.jsonl`.
+
+```bash
+uv run --locked --env-file .env.local python -m orchestrator.us run --mode demo --strategy momentum --budget 10000 --trial auto1 --universe-mode auto
+```
+
+`--stocks` is ignored in automatic mode; omitting `--universe-mode` in the CLI retains
+manual mode. CSV replay remains fixed-universe. Applying today's winners to past prices
+is not a historical test of automatic discovery; contemporaneous selections and prices
+are both needed.
+
+### Entry and exit rules within the candidates
+
 Both strategies are long-only US equities, with no shorting, borrowing, options, or Korean orders. They support observing a short experiment, not guaranteed maximum weekly returns or a historically optimized portfolio.
 
 | Rule | `momentum` | `opening-range` |
@@ -204,7 +258,7 @@ Both strategies are long-only US equities, with no shorting, borrowing, options,
 
 Both need at least 22 completed current-session bars, including 22 consecutive recent minutes. Opening-range trading does not start immediately after minute 15. Entry filters also require price at least USD 5, recent average minute turnover at least USD 250,000, and bid/ask spread at most 0.2%.
 
-The default scan list is `AAPL, MSFT, NVDA, AMD, AMZN, META, GOOGL, TSLA`. These are candidates, not unconditional purchases or predicted weekly winners. To specify candidates:
+The manual-mode default scan list is `AAPL, MSFT, NVDA, AMD, AMZN, META, GOOGL, TSLA`. These are candidates, not unconditional purchases or predicted weekly winners. To specify candidates:
 
 ```bash
 uv run --locked --env-file .env.local python -m orchestrator.us run --mode demo --strategy momentum --budget 10000 --trial custom1 --stocks AAPL,NASD:NVDA,NYSE:IBM
@@ -342,6 +396,13 @@ Toss references are saved in the [local documentation index](./docs/toss/INDEX.m
 
 ## Troubleshooting
 
+Transient quote/account transport failures, HTTP 429, and server errors keep the runner
+alive with backoff from five to sixty seconds; authentication transport failures wait at
+least 65 seconds. No new order decisions occur during the wait. Saved positions and
+orders are retained. The dashboard shows the failed endpoint and next attempt, also
+recorded in `*.errors.jsonl`. Invalid credentials/accounts and uncertain order outcomes
+remain fatal, not automatically resubmitted. Exits cannot be guaranteed during an outage.
+
 | Symptom | Action |
 |---|---|
 | `uv: command not found` | Install uv, reopen Terminal, and return to the project folder |
@@ -453,7 +514,7 @@ All data is managed on the **Data tab of the dashboard**.
 | KIS Korean equities | Implemented | Implemented | LEAN dashboard; account validation and restart open-order synchronization still need work |
 | Toss Korean equities | Not provided | Implemented | LEAN dashboard; real-account validation incomplete |
 
-US equities use the terminal commands above. The following broker notes apply to the Korean dashboard.
+US equities use the US-equity tab or terminal commands above. The following broker notes apply to the Korean dashboard.
 
 - Pick a broker on the Settings tab and enter its keys; inquiry and live orders then run through that broker.
 - KIS keeps **live and paper app keys/accounts fully separate**, so each is registered and managed independently (same logic, different environment).
@@ -464,7 +525,7 @@ US equities use the terminal commands above. The following broker notes apply to
 
 ## Dashboard
 
-This dashboard is for Korean equities. Inspect US runs with `orchestrator.us status`.
+Use the US-equity tab for the two preset strategies and monitoring, or `orchestrator.us status`. The remaining tabs described below are for Korean equities.
 
 | Tab | Contents |
 |---|---|
@@ -620,7 +681,7 @@ uv run --locked python -m orchestrator.lean --prepare
 scripts/build-adapter.sh
 ```
 
-6. In **Trade**, confirm broker, paper/real indicator, and symbols before enabling trading. `kis_demo` submits paper orders; `kis` and `toss` submit real orders. US `momentum` and `opening-range` are not dashboard strategies.
+6. In **Trade**, confirm broker, paper/real indicator, and symbols before enabling trading. `kis_demo` submits paper orders; `kis` and `toss` submit real orders. US `momentum` and `opening-range` use the separate US-equity tab, not this domestic Trade tab.
 7. Turn trading OFF first, then check broker holdings and pending orders. Stopping the process does not cancel/liquidate. Leaving trading enabled when shutting down the server may resume it on the next server start.
 
 Korean KIS restart open-order synchronization and account-level fill validation remain incomplete. See [KIS Korean-equity trading](./docs/LIVE_KIS.md) and [Toss Korean-equity trading](./docs/LIVE_TOSS.md).

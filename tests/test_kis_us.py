@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 import pytest
 import requests
 
-from brokers.kis_us import BrokerError, KisUsClient, OrderUncertain, RequestPacer, limit_price
+from brokers.kis_us import BrokerError, KisUsClient, OrderUncertain, QueryUnavailable, RequestPacer, limit_price
 from market.us import session_for
 from orchestrator.us_strategy import Stock, NEW_YORK
 
@@ -80,6 +80,26 @@ def test_order_timeout_does_not_resubmit():
     assert len(transport.calls) == 2
 
 
+def test_read_timeout_is_retryable_and_does_not_leak_request_data():
+    instance, transport = client([requests.Timeout("synthetic-secret")])
+    with pytest.raises(QueryUnavailable) as failure:
+        instance.quote(Stock("AAPL"))
+    assert failure.value.endpoint.endswith("/quotations/price")
+    assert "Timeout" in str(failure.value)
+    assert "synthetic-secret" not in str(failure.value)
+    assert not isinstance(failure.value, OrderUncertain)
+
+
+def test_read_server_failure_can_recover_but_account_rejection_is_fatal():
+    instance, _ = client([Response({"msg_cd": "SERVER_ERROR"}, status=503)])
+    with pytest.raises(QueryUnavailable):
+        instance.quote(Stock("AAPL"))
+    instance, _ = client([Response({"rt_cd": "1", "msg_cd": "OPSQ2000"})])
+    with pytest.raises(BrokerError) as failure:
+        instance.quote(Stock("AAPL"))
+    assert not isinstance(failure.value, QueryUnavailable)
+
+
 def test_explicit_rate_rejection_can_retry_without_hammering():
     instance, transport = client([
         Response({"rt_cd": "1", "msg_cd": "EGW00201"}, status=500),
@@ -126,12 +146,17 @@ def test_price_rounding_and_invalid_quantities():
     assert not transport.calls
 
 
-def test_book_requires_timestamp_and_both_sides():
-    instance, _ = client([Response({"rt_cd": "0", "output1": {"last": "100", "dymd": "20260921", "dhms": "100000"},
+@pytest.mark.parametrize("day, clock, expected", [
+    ("20260921", "230000", datetime(2026, 9, 21, 10, tzinfo=NEW_YORK)),
+    ("20260106", "000000", datetime(2026, 1, 5, 10, tzinfo=NEW_YORK)),
+])
+def test_book_requires_korean_timestamp_and_both_sides(day, clock, expected):
+    instance, _ = client([Response({"rt_cd": "0", "output1": {"last": "100", "dymd": day, "dhms": clock},
                                    "output2": {"pbid1": "99.99", "pask1": "100.01"}, "output3": {}})])
     quote = instance.book(Stock("AAPL"))
-    assert quote.fresh(datetime(2026, 9, 21, 10, 0, 30, tzinfo=NEW_YORK))
-    assert not quote.fresh(datetime(2026, 9, 21, 10, 15, tzinfo=NEW_YORK))
+    assert quote.time == expected
+    assert quote.fresh(expected.replace(second=30))
+    assert not quote.fresh(expected.replace(minute=15))
     assert quote.spread < 0.002
 
 
@@ -144,6 +169,15 @@ def test_bars_do_not_expose_in_progress_minute():
     bars = instance.bars(Stock("AAPL"), now.replace(hour=9, minute=30), now)
     assert len(bars) == 1 and bars[0].end.minute == 55
     assert transport.calls[-1][3]["params"]["EXCD"] == "NAS"
+
+
+def test_rankings_use_existing_pacer_and_official_request_fields():
+    instance, transport = client([Response({"rt_cd": "0", "output2": []})])
+    assert instance.rankings("price", "NYSE") == []
+    request = transport.calls[-1][3]
+    assert request["headers"]["tr_id"] == "HHDFS76260000"
+    assert request["params"]["EXCD"] == "NYS"
+    assert request["params"]["MINX"] == "5" and request["params"]["GUBN"] == "1"
 
 
 def test_missing_acknowledgment_number_is_uncertain():

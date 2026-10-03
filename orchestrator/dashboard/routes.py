@@ -425,6 +425,8 @@ def register_dashboard(
         from ..live_runner import LiveProcessManager
         live_manager = LiveProcessManager(jobs)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    from ..us_dashboard import register_us_dashboard
+    register_us_dashboard(app, templates, app.state.us_dashboard)
 
     def submit_backtest(name: str, req: RunRequest):
         """백테스트를 백그라운드 잡으로 실행(요청 비차단). 잡에 run_id/log_path를 실어 진행 추적."""
@@ -436,10 +438,10 @@ def register_dashboard(
             return f"{rec['run_id']} · 주문 {rec['statistics'].get('Total Orders','-')} · Net {rec['statistics'].get('Net Profit','-')}"
         return jobs.submit(name, _bt)
 
-    # ── 랜딩: 전략 설정 탭으로 ────────────────────────────────────────
+    # 미국주식을 첫 화면으로 제공하고 국내 전략은 기존 경로로 유지한다.
     @app.get("/")
     def index_redirect():
-        return RedirectResponse(url="/strategy", status_code=307)
+        return RedirectResponse(url="/us", status_code=307)
 
     # ── 백테스트 탭 ──────────────────────────────────────────────────
     @app.get("/backtest", response_class=HTMLResponse)

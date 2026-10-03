@@ -10,30 +10,36 @@ from pathlib import Path
 from brokers.kis_us import BrokerError, OrderUncertain, limit_price, private_json
 from market.us import session_for
 from .us_strategy import (
-    Bar, Entry, NEW_YORK, Position, Stock, Strategy,
+    Bar, Entry, NEW_YORK, Position, Stock, Strategy, US_EXCHANGES,
     entry_signal, exit_reason, loss_limit, size_entry,
 )
+from .us_universe import UniverseScanner
 
 
 class UsRunner:
     def __init__(self, broker, strategy: Strategy, stocks: tuple[Stock, ...], budget: float,
-                 state_path: Path | None = None, *, now=None, on_event=None):
-        if not math.isfinite(budget) or budget <= 0 or not stocks:
+                 state_path: Path | None = None, *, now=None, on_event=None, universe_mode="manual"):
+        if universe_mode not in ("manual", "auto"):
+            raise ValueError("종목 탐색 방식은 manual 또는 auto입니다")
+        if not math.isfinite(budget) or budget <= 0 or (not stocks and universe_mode == "manual"):
             raise ValueError("양수인 USD 예산과 미국 주식 후보가 필요합니다")
         if len({stock.symbol for stock in stocks}) != len(stocks):
             raise ValueError("중복 종목은 사용할 수 없습니다")
-        self.broker, self.strategy, self.stocks, self.budget = broker, strategy, stocks, budget
+        self.broker, self.strategy, self.budget = broker, strategy, budget
+        self.stocks = stocks if universe_mode == "manual" else ()
         self.path = state_path
         self.now = now or (lambda: datetime.now(NEW_YORK))
         self.on_event = on_event or (lambda event: None)
         self.bars: dict[str, list[Bar]] = {}
         self.last_scan = None
         self.last_sync = None
+        self.scan_times = {}
         self.started = False
         self.state = {
             "profile": broker.profile, "mode": broker.mode, "strategy": strategy.name, "budget": budget,
             "strategy_settings": asdict(strategy),
-            "stocks": [asdict(stock) for stock in stocks], "started_at": self.now().isoformat(),
+            "stocks": [asdict(stock) for stock in self.stocks], "started_at": self.now().isoformat(),
+            "universe_mode": universe_mode,
             "sessions": [], "day": "", "day_start_profit": 0.0, "cash_flow": 0.0,
             "positions": {}, "pending": {}, "fills": [], "entry_counts": {},
             "cooldown": {}, "marks": {}, "excluded": [], "halt": "", "peak_equity": budget,
@@ -43,10 +49,19 @@ class UsRunner:
         if state_path and state_path.exists():
             import json
             saved = json.loads(state_path.read_text(encoding="utf-8"))
+            if saved.get("universe_mode", "manual") != universe_mode:
+                raise BrokerError("저장된 종목 탐색 방식이 다릅니다. 새 실험 이름을 사용하세요")
             for key in ("profile", "mode", "strategy", "budget", "stocks", "strategy_settings"):
                 if saved.get(key) != self.state[key]:
                     raise BrokerError("실행 상태의 계좌·환경·전략·예산·종목이 다릅니다. 기존 실행을 확인하세요")
             self.state = saved
+        self.state["universe_mode"] = universe_mode
+        self.scanner = None
+        if universe_mode == "auto":
+            universe = self.state.setdefault("universe", {"candidates": [], "progress": 0, "error": ""})
+            self.scanner = UniverseScanner(broker, strategy, universe,
+                state_path.with_suffix(".universe.jsonl") if state_path else None)
+            self.stocks = tuple(Stock(row["symbol"], row["exchange"]) for row in universe["candidates"])
         if any(not pending.get("number") for pending in self.state["pending"].values()):
             raise OrderUncertain("응답을 확인하지 못한 주문이 남아 있습니다. status와 증권사 주문내역을 대조하세요")
 
@@ -77,7 +92,8 @@ class UsRunner:
 
     def start(self):
         self.sync_orders(force=True)
-        rows = self.broker.holdings({stock.exchange for stock in self.stocks})
+        exchanges = set(US_EXCHANGES) if self.scanner else {stock.exchange for stock in self.stocks}
+        rows = self.broker.holdings(exchanges)
         holdings = {str(row["ovrs_pdno"]): int(float(row["ovrs_cblc_qty"])) for row in rows}
         for symbol, position in self.state["positions"].items():
             if holdings.get(symbol, 0) != position["quantity"]:
@@ -236,6 +252,10 @@ class UsRunner:
             self.state["day"] = day
             self.state["entry_counts"] = {}
             self.bars.clear()
+            self.scan_times.clear()
+            if self.scanner:
+                self.scanner.pending.clear()
+                self.scanner.attempted = self.scanner.verified = False
             if day not in self.state["sessions"]:
                 self.state["sessions"].append(day)
             if self.state["halt"] == "일일 손실 한도":
@@ -277,10 +297,29 @@ class UsRunner:
                     self.submit(position.stock, "SELL", position.quantity, price, reason)
 
         minute = now.replace(second=0, microsecond=0)
-        if self.last_scan != minute and not self.state["halt"]:
+        scan_stocks = ()
+        if self.scanner:
+            if not self.state["halt"] and now < session.close - timedelta(minutes=45):
+                self.scanner.step(self.now(), session.open, self.state["excluded"])
+                self.stocks = tuple(Stock(row["symbol"], row["exchange"])
+                                    for row in self.state["universe"]["candidates"])
+                keep = {stock.symbol for stock in self.stocks}
+                self.bars = {symbol: bars for symbol, bars in self.bars.items() if symbol in keep}
+                if self.scanner.ready(self.now(), session.open):
+                    due = [stock for stock in self.stocks
+                           if self.scan_times.get(stock.symbol) != minute
+                           and stock.symbol not in self.state["positions"]
+                           and stock.symbol not in self.state["pending"]]
+                    if due:
+                        stock = min(due, key=lambda stock: self.scan_times.get(stock.symbol, session.open))
+                        scan_stocks = (stock,)
+                        self.scan_times[stock.symbol] = minute
+        elif self.last_scan != minute:
+            scan_stocks = self.stocks
+        if scan_stocks and not self.state["halt"]:
             self.last_scan = minute
             signals = []
-            for stock in self.stocks:
+            for stock in scan_stocks:
                 if stock.symbol in self.state["excluded"]:
                     continue
                 history = self.bars.get(stock.symbol, [])
@@ -293,6 +332,8 @@ class UsRunner:
                     signals.append(signal)
             self.emit("scan", candidates=len(self.stocks), signals=len(signals))
             for signal in sorted(signals, key=lambda signal: signal.score, reverse=True):
+                if self.scanner and not self.scanner.ready(self.now(), session.open):
+                    break
                 symbol = signal.stock.symbol
                 counts = self.state["entry_counts"]
                 if (symbol in self.state["positions"] or symbol in self.state["pending"]
